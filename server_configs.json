@@ -1,0 +1,27 @@
+{
+  "GUILD_ID_1": {
+    "hash_db_file": "hashes_GUILD_ID_1.json",
+    "hash_size": 8,
+    "similarity_threshold": 5,
+    "allowed_channel_ids": null,
+    "react_to_duplicates": true,
+    "delete_duplicates": false,
+    "duplicate_reaction_emoji": "⚠️",
+    "duplicate_scope": "server",
+    "duplicate_check_mode": "strict"
+  },
+  "GUILD_ID_2": {
+    "hash_db_file": "hashes_GUILD_ID_2.json",
+    "hash_size": 8,
+    "similarity_threshold": 4,
+    "allowed_channel_ids": [
+      "CHANNEL_ID_A",
+      "CHANNEL_ID_B"
+    ],
+    "react_to_duplicates": true,
+    "delete_duplicates": true,
+    "duplicate_reaction_emoji": "❌",
+    "duplicate_scope": "channel",
+    "duplicate_check_mode": "owner_allowed"
+  }
+}
