@@ -6,7 +6,7 @@ Discord bot to detect duplicate images using Slash Commands.
 Supports per-server configuration, scope, check mode, time limits,
 history scanning (/scan - finds oldest, optionally flags/replies/deletes non-oldest),
 hash management (/hash_remove, /hash_clear), user allowlisting (/allowlist_add etc.),
-and retroactive flag clearing (/clearflags). All commands are top-level.
+retroactive flag clearing (/clearflags), and configurable reply messages.
 Loads token from .env, settings from server_configs.json.
 Requires discord.py v2.x (Pycord)
 """
@@ -41,6 +41,16 @@ SCAN_UPDATE_INTERVAL = 100
 SCAN_ACTION_DELAY = 0.35 # Delay for scan actions (flag/reply/delete)
 CLEAR_REACTION_DELAY = 0.2 # Delay for clearing reactions
 
+# Default Reply Template Placeholders:
+# {mention}: Mention of the user who posted the duplicate.
+# {filename}: Original filename of the duplicate image.
+# {identifier}: The internal identifier for the matched original image (message_id-filename).
+# {distance}: The hash distance (similarity score) between the images.
+# {original_user_mention}: Mention of the user who posted the original image (if known).
+# {jump_url}: Link to the original message (if possible).
+DEFAULT_REPLY_TEMPLATE = "{emoji} Hold on, {mention}! Image `{filename}` similar to recent submission (ID: `{identifier}`, Dist: {distance}{original_user_info}).{jump_link}"
+
+
 # --- Load Environment Variables ---
 load_dotenv()
 BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
@@ -50,10 +60,10 @@ server_configs = {}
 config_lock = asyncio.Lock()
 hash_file_locks = {}
 
-# --- Configuration Loading/Saving (Functions remain the same) ---
+# --- Configuration Loading/Saving ---
 
 def get_default_guild_config(guild_id):
-    """Returns default settings, including allowlist."""
+    """Returns default settings, including allowlist and reply template."""
     return {
         "hash_db_file": f"{HASH_FILENAME_PREFIX}{guild_id}.json",
         "hash_size": 8,
@@ -65,7 +75,8 @@ def get_default_guild_config(guild_id):
         "duplicate_scope": "server",
         "duplicate_check_mode": "strict",
         "duplicate_check_duration_days": 0, # 0 = check forever
-        "allowed_users": [] # List of user IDs exempt from checks
+        "allowed_users": [], # List of user IDs exempt from checks
+        "duplicate_reply_template": DEFAULT_REPLY_TEMPLATE # New setting
     }
 
 def validate_config_data(config_data):
@@ -97,6 +108,10 @@ def validate_config_data(config_data):
             validated['allowed_users'] = []
         else:
             validated['allowed_users'] = [int(u_id) for u_id in validated['allowed_users'] if str(u_id).isdigit()]
+
+        # Ensure reply template is a string
+        if not isinstance(validated.get('duplicate_reply_template'), str):
+            validated['duplicate_reply_template'] = DEFAULT_REPLY_TEMPLATE
 
     except (ValueError, TypeError, KeyError) as e:
         print(f"Warning: Error validating config types/keys: {e}. Some defaults may be used.", file=sys.stderr)
@@ -329,6 +344,7 @@ async def on_message(message):
     react_to_duplicates = guild_config.get('react_to_duplicates', True)
     delete_duplicates = guild_config.get('delete_duplicates', False)
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
+    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE) # Get template
 
     if allowed_channel_ids and channel_id not in allowed_channel_ids: return
     if not message.attachments: return
@@ -361,12 +377,27 @@ async def on_message(message):
                 if is_violation and violating_match:
                     identifier = violating_match['identifier']; distance = violating_match['distance']
                     original_message_id = violating_match.get('original_message_id'); original_user_id = violating_match.get('original_user_id')
-                    reply_text = f"{duplicate_reaction_emoji} Hold on, {message.author.mention}! Image `{attachment.filename}` similar to recent submission (ID: `{identifier}`, Dist: {distance}"
-                    if original_user_id: reply_text += f", Orig User: <@{original_user_id}>"
-                    reply_text += ")."
+
+                    # --- Format Reply using Template ---
+                    template_data = {
+                        "mention": message.author.mention,
+                        "filename": attachment.filename,
+                        "identifier": identifier,
+                        "distance": distance,
+                        "original_user_mention": f"<@{original_user_id}>" if original_user_id else "*Unknown*",
+                        "emoji": duplicate_reaction_emoji,
+                        "original_user_info": f", Orig User: <@{original_user_id}>" if original_user_id else "", # Optional part
+                        "jump_link": "" # Placeholder for jump link
+                    }
                     if original_message_id and message.guild:
-                        try: jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"; reply_text += f"\nOriginal: {jump_url}"
-                        except: pass
+                        try:
+                            jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
+                            template_data["jump_link"] = f"\nOriginal: {jump_url}"
+                        except: pass # Ignore errors creating jump url
+
+                    # Use safe formatting (ignore missing keys)
+                    reply_text = reply_template.format_map(defaultdict(str, template_data))
+
                     await message.reply(reply_text, mention_author=True)
 
                     if react_to_duplicates:
@@ -430,6 +461,7 @@ async def config_view(interaction: discord.Interaction):
         if key == 'allowed_channel_ids': display_value = ', '.join(f'<#{ch_id}>' for ch_id in value) if value else "All Channels"
         elif key == 'hash_db_file': display_value = f"`{value}`"
         elif key == 'allowed_users': display_value = ', '.join(f'<@{u_id}>' for u_id in value) if value else "None"
+        elif key == 'duplicate_reply_template': display_value = f"```\n{value}\n```" # Show template in code block
         elif isinstance(value, bool): display_value = "Enabled" if value else "Disabled"
         embed.add_field(name=key.replace('_', ' ').title(), value=display_value, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -443,6 +475,7 @@ async def _update_config(interaction: discord.Interaction, setting: str, new_val
     if await save_guild_config(guild_id, guild_config):
         display_new = new_value
         if setting == 'duplicate_check_duration_days': display_new = f"{new_value} days" if new_value > 0 else "Forever"
+        elif setting == 'duplicate_reply_template': display_new = f"```\n{new_value}\n```" # Show template in code block
         await interaction.response.send_message(f"✅ Updated '{setting}' from `{original_value}` to `{display_new}`.", ephemeral=True)
         if setting == 'duplicate_scope': await interaction.followup.send(f"⚠️ **Warning:** Changing scope might affect hash lookup.", ephemeral=True)
     else:
@@ -498,6 +531,21 @@ async def config_set_duration(interaction: discord.Interaction, value: discord.O
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
     await _update_config(interaction, "duplicate_check_duration_days", value)
+
+@bot.slash_command(name="config_set_reply_template", description="Sets the template for duplicate reply messages.")
+async def config_set_reply_template(interaction: discord.Interaction, template: discord.Option(str, "The template string. See README for placeholders.")):
+    """Sets the duplicate reply template."""
+    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
+    # Basic validation: Ensure it's a non-empty string
+    if not template or not isinstance(template, str):
+        await interaction.response.send_message("❌ Template cannot be empty.", ephemeral=True)
+        return
+    if len(template) > 1500: # Keep template reasonably short
+        await interaction.response.send_message("❌ Template is too long (max 1500 chars).", ephemeral=True)
+        return
+    await _update_config(interaction, "duplicate_reply_template", template)
+    await interaction.followup.send(f"ℹ️ Placeholders: `{{mention}}`, `{{filename}}`, `{{identifier}}`, `{{distance}}`, `{{original_user_mention}}`, `{{emoji}}`, `{{original_user_info}}`, `{{jump_link}}`", ephemeral=True)
 
 
 # --- Config Channel Commands (Now Top-Level) ---
@@ -682,6 +730,7 @@ async def scan_history(
     current_mode = guild_config.get('duplicate_check_mode', 'strict')
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
     current_duration = guild_config.get('duplicate_check_duration_days', 0)
+    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE) # Get template for replies
 
     # Check permissions
     bot_member = interaction.guild.me
@@ -778,7 +827,24 @@ async def scan_history(
                 # Reply
                 if reply_to_duplicates:
                     try:
-                        reply_text = f"{duplicate_reaction_emoji} Similar image found (Ref Scan: `{oldest_identifier}`, User: <@{oldest_user_id}>)"
+                        # Format reply using template
+                        template_data = {
+                            "mention": f"<@{entry_user_id}>", # Mention the user of *this* message
+                            "filename": entry_filename,
+                            "identifier": oldest_identifier, # Reference the oldest
+                            "distance": "?", # Distance isn't easily available here, maybe omit or calculate if needed
+                            "original_user_mention": f"<@{oldest_user_id}>" if oldest_user_id else "*Unknown*",
+                            "emoji": duplicate_reaction_emoji,
+                            "original_user_info": f", Orig User: <@{oldest_user_id}>" if oldest_user_id else "",
+                            "jump_link": ""
+                        }
+                        if oldest_message_obj:
+                            try:
+                                jump_url = oldest_message_obj.jump_url
+                                template_data["jump_link"] = f"\nOriginal: {jump_url}"
+                            except: pass
+                        reply_text = reply_template.format_map(defaultdict(str, template_data))
+
                         await entry_message_obj.reply(reply_text, mention_author=False)
                         replied_count += 1; action_taken = True
                     except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages perm.")
