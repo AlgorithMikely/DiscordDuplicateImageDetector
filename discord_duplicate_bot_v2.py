@@ -7,6 +7,7 @@ Supports per-server configuration, scope, check mode, time limits,
 history scanning (/scan), hash management (/removehash, /clearhashes),
 and user allowlisting (/allowlist).
 Loads token from .env, settings from server_configs.json.
+Requires discord.py v2.x (Pycord)
 """
 
 import discord
@@ -285,6 +286,7 @@ intents.message_content = True # Still needed to read image attachments
 intents.guilds = True
 intents.members = True # Needed for fetching users sometimes
 
+# IMPORTANT: Initialize using discord.Bot for slash commands
 bot = discord.Bot(intents=intents)
 
 # --- Event Handlers ---
@@ -296,7 +298,14 @@ async def on_ready():
     print(f'--- Ready for {len(bot.guilds)} guilds ---')
     for guild in bot.guilds: _ = get_guild_config(guild.id) # Ensure configs exist
     # Sync slash commands (can take up to an hour globally, faster per-guild)
-    # await bot.sync_commands() # Consider guild-specific syncing if needed
+    # Use try-except as sync_commands might fail if bot lacks 'application.commands' scope
+    try:
+        print("--- Syncing slash commands... ---")
+        await bot.sync_commands()
+        print("--- Slash commands synced ---")
+    except Exception as e:
+        print(f"--- Failed to sync slash commands: {e} ---")
+        print("--- Ensure the bot was invited with the 'applications.commands' scope ---")
     print('------ Bot is ready! ------')
 
 @bot.event
@@ -304,8 +313,12 @@ async def on_guild_join(guild):
      """Called when the bot joins a new guild."""
      print(f"Joined new guild: {guild.name} (ID: {guild.id})")
      _ = get_guild_config(guild.id); await save_main_config()
-     # Consider syncing commands for the new guild here if not syncing globally
-     # await bot.register_commands(guild_ids=[guild.id])
+     # Consider guild-specific syncing if not syncing globally
+     # try:
+     #     await bot.sync_commands(guild_ids=[guild.id])
+     #     print(f"--- Synced commands for new guild {guild.id} ---")
+     # except Exception as e:
+     #     print(f"--- Failed to sync commands for new guild {guild.id}: {e} ---")
 
 @bot.event
 async def on_message(message):
@@ -374,8 +387,7 @@ async def on_message(message):
                     if original_message_id and message.guild:
                          try: jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"; reply_text += f"\nOriginal: {jump_url}"
                          except: pass
-                    # Use interaction response methods if possible, fallback to message.reply
-                    # Since this is on_message, we reply directly to the message
+                    # Reply directly to the message in on_message context
                     await message.reply(reply_text, mention_author=True)
 
                     if react_to_duplicates:
@@ -414,19 +426,25 @@ async def on_message(message):
 # Helper for permission checks
 async def check_admin_permissions(interaction: discord.Interaction) -> bool:
     """Checks if the invoking user has administrator permissions."""
+    # Ensure the interaction user is a Member object with permissions
+    if not isinstance(interaction.user, discord.Member):
+         # If interaction user isn't a member (e.g., DM?), they can't be admin
+         await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True)
+         return False
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You need Administrator permissions to use this command.", ephemeral=True)
         return False
     return True
 
 # --- Config Command Group ---
+# Use bot.create_group for slash command groups with discord.Bot
 config_group = bot.create_group("config", "Manage bot configuration for this server.")
 
 @config_group.command(name="view", description="Shows the current bot configuration for this server.")
 async def config_view(interaction: discord.Interaction):
     """Displays the current server configuration."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id
     guild_config = get_guild_config(guild_id)
@@ -451,16 +469,15 @@ async def config_set(
         "similarity_threshold", "hash_size", "react_to_duplicates", "delete_duplicates",
         "duplicate_reaction_emoji", "duplicate_scope", "duplicate_check_mode",
         "duplicate_check_duration_days"
-    ]), # Use choices for better UX
+    ]),
     value: discord.Option(str, description="The new value for the setting.")
 ):
     """Sets a configuration value."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id
     guild_config = get_guild_config(guild_id).copy()
-    # Setting name is already validated by choices
 
     original_value = guild_config.get(setting); new_value = None; error_msg = None
     try:
@@ -474,11 +491,8 @@ async def config_set(
             elif value.lower() in ['false', 'off', 'no', '0', 'disable', 'disabled']: new_value = False
             else: error_msg = "Value must be true or false (or on/off, etc.)."
         elif setting == 'duplicate_reaction_emoji':
-            try: # Test emoji by trying to add it to the interaction message (won't be visible)
-                 await interaction.message.add_reaction(value) # Check if bot can use it
-                 await interaction.message.remove_reaction(value, bot.user) # Clean up immediately
-                 new_value = value
-            except Exception: error_msg = "Invalid or inaccessible emoji." # Catch broad exception for invalid emoji
+            # Skip reaction test in interaction context for simplicity
+            new_value = value # Assume valid emoji input
     except (ValueError, AssertionError): error_msg = f"Invalid value format/range for '{setting}'."
     except Exception as e: error_msg = f"Unexpected validation error: {e}"
 
@@ -500,8 +514,8 @@ config_channel_group = config_group.create_subgroup("channel", "Manage the allow
 @config_channel_group.command(name="view", description="Shows the list of channels currently monitored.")
 async def config_channel_view(interaction: discord.Interaction):
     """Displays the allowed channels."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id)
     channel_list = guild_config.get('allowed_channel_ids')
@@ -513,8 +527,8 @@ async def config_channel_view(interaction: discord.Interaction):
 @config_channel_group.command(name="add", description="Adds a channel to the allowed list.")
 async def config_channel_add(interaction: discord.Interaction, channel: discord.Option(discord.TextChannel, "The text channel to allow.")):
     """Adds a channel to the allowed list."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); channel_id = channel.id
     if guild_config.get('allowed_channel_ids') is None: guild_config['allowed_channel_ids'] = []
@@ -527,8 +541,8 @@ async def config_channel_add(interaction: discord.Interaction, channel: discord.
 @config_channel_group.command(name="remove", description="Removes a channel from the allowed list.")
 async def config_channel_remove(interaction: discord.Interaction, channel: discord.Option(discord.TextChannel, "The text channel to remove.")):
     """Removes a channel from the allowed list."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); channel_id = channel.id
     if guild_config.get('allowed_channel_ids') and channel_id in guild_config['allowed_channel_ids']:
@@ -541,8 +555,8 @@ async def config_channel_remove(interaction: discord.Interaction, channel: disco
 @config_channel_group.command(name="clear", description="Clears the allowed channel list (monitors all).")
 async def config_channel_clear(interaction: discord.Interaction):
     """Clears the allowed channel list."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy()
     if guild_config.get('allowed_channel_ids') is not None:
@@ -557,8 +571,8 @@ allowlist_group = bot.create_group("allowlist", "Manage users exempt from duplic
 @allowlist_group.command(name="view", description="Shows the current user allowlist for this server.")
 async def allowlist_view(interaction: discord.Interaction):
     """Displays the allowlisted users."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id)
     user_list = guild_config.get('allowed_users', [])
@@ -576,8 +590,8 @@ async def allowlist_view(interaction: discord.Interaction):
 @allowlist_group.command(name="add", description="Adds a user to the allowlist (exempt from checks).")
 async def allowlist_add(interaction: discord.Interaction, user: discord.Option(discord.User, "The user to allowlist.")):
     """Adds a user to the allowlist."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); user_id = user.id
     if 'allowed_users' not in guild_config or guild_config['allowed_users'] is None: guild_config['allowed_users'] = []
@@ -590,8 +604,8 @@ async def allowlist_add(interaction: discord.Interaction, user: discord.Option(d
 @allowlist_group.command(name="remove", description="Removes a user from the allowlist.")
 async def allowlist_remove(interaction: discord.Interaction, user: discord.Option(discord.User, "The user to remove from the allowlist.")):
     """Removes a user from the allowlist."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); user_id = user.id
     if 'allowed_users' in guild_config and guild_config['allowed_users'] and user_id in guild_config['allowed_users']:
@@ -614,8 +628,8 @@ def parse_message_id(message_ref: str) -> int | None:
 @hash_group.command(name="remove", description="Removes the stored hash associated with a specific message ID or link.")
 async def remove_hash(interaction: discord.Interaction, message_reference: discord.Option(str, "The message ID or link containing the image hash to remove.")):
     """Removes a hash entry based on the original message ID."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id)
     current_scope = guild_config.get('duplicate_scope', 'server'); loop = asyncio.get_running_loop()
@@ -651,12 +665,12 @@ async def remove_hash(interaction: discord.Interaction, message_reference: disco
 @hash_group.command(name="clear", description="Clears hashes for the server or a channel. Requires confirmation!")
 async def clear_hashes(
     interaction: discord.Interaction,
-    channel: discord.Option(discord.TextChannel, "Optional: Specify a channel to clear hashes only for that channel (if scope is 'channel').", required=False, default=None),
-    confirm: discord.Option(bool, "Must be True to confirm deletion.", required=True)
+    confirm: discord.Option(bool, "Must be True to confirm deletion.", required=True), # Moved confirm first
+    channel: discord.Option(discord.TextChannel, "Optional: Specify a channel to clear hashes only for that channel (if scope is 'channel').", required=False, default=None)
 ):
     """Clears hashes with confirmation."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     if not confirm:
         await interaction.response.send_message(f"🛑 **Confirmation required!** Set the `confirm` option to `True` to proceed with deleting hashes.", ephemeral=True)
@@ -696,8 +710,8 @@ async def scan_history(
     limit: discord.Option(int, "Max number of messages to scan.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT) # Add limits
 ):
     """Scans past messages in a channel to populate the hash database."""
-    if not await check_admin_permissions(interaction): return
     if not interaction.guild_id: await interaction.response.send_message("❌ This command only works in a server.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
 
     guild_id = interaction.guild_id; scan_channel_id = channel.id; scan_channel_id_str = str(scan_channel_id)
     guild_config = get_guild_config(guild_id); current_scope = guild_config.get('duplicate_scope', 'server')
@@ -712,7 +726,8 @@ async def scan_history(
     await interaction.response.defer(ephemeral=False) # Send initial thinking message publicly
 
     status_message_content = f"⏳ Starting scan of up to **{limit}** messages in {channel.mention}..."
-    await interaction.followup.send(status_message_content) # Initial status
+    # Send initial status as a followup message and store it
+    status_message = await interaction.followup.send(status_message_content, wait=True)
 
     processed_messages = 0; added_hashes = 0; skipped_attachments = 0; errors = 0
     loop = asyncio.get_running_loop()
@@ -723,11 +738,13 @@ async def scan_history(
             processed_messages += 1
             # Update status periodically
             if processed_messages % SCAN_UPDATE_INTERVAL == 0:
+                # Edit the message sent via followup.send
                 try:
-                    # Edit the original deferred response message
-                    await interaction.edit_original_response(content=f"⏳ Scanning... Processed {processed_messages}/{limit}. Added {added_hashes} new hashes.")
-                except discord.HTTPException: pass # Ignore if editing fails
-                except Exception as e: print(f"DEBUG: Error editing status message: {e}")
+                    await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit}. Added {added_hashes} new hashes.")
+                except discord.HTTPException:
+                    pass # Ignore if editing fails (e.g., rate limit, message deleted)
+                except Exception as e:
+                    print(f"DEBUG: Error editing status message: {e}")
 
             if message.author.bot or not message.attachments: continue
             message_user_id = message.author.id; message_timestamp_iso = message.created_at.replace(tzinfo=datetime.timezone.utc).isoformat()
@@ -752,8 +769,13 @@ async def scan_history(
                     except discord.HTTPException as e: print(f"Warning: [Scan G:{guild_id}] Failed download {attachment.id}: {e}"); errors += 1; skipped_attachments += 1
                     except Exception as e: print(f"Error: [Scan G:{guild_id}] Error processing attach {attachment.id}: {e}"); errors += 1; skipped_attachments += 1; traceback.print_exc()
 
-    except discord.Forbidden: await interaction.edit_original_response(content=f"❌ Scan failed. Bot lacks permissions in {channel.mention}."); return
-    except Exception as e: await interaction.edit_original_response(content=f"❌ Error during scan: {e}"); traceback.print_exc(); return
+    except discord.Forbidden:
+        # Edit the status message on error
+        await status_message.edit(content=f"❌ Scan failed. Bot lacks permissions in {channel.mention}.")
+        return
+    except Exception as e:
+        await status_message.edit(content=f"❌ Error during scan: {e}")
+        traceback.print_exc(); return
     finally:
         if db_updated:
             print(f"DEBUG: [Scan G:{guild_id}] Saving updated hash database after scan...")
@@ -762,8 +784,8 @@ async def scan_history(
                  try: await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
                  except: pass # Ignore if followup fails too
 
-    # Final status update
-    await interaction.edit_original_response(content=f"✅ Scan Complete! Processed {processed_messages}. Added **{added_hashes}** new hashes. Skipped {skipped_attachments}. Errors: {errors}.")
+    # Final status update - edit the status message
+    await status_message.edit(content=f"✅ Scan Complete! Processed {processed_messages}. Added **{added_hashes}** new hashes. Skipped {skipped_attachments}. Errors: {errors}.")
 
 
 # --- Main Execution ---
@@ -774,4 +796,3 @@ if __name__ == "__main__":
     try: print("Starting bot..."); bot.run(BOT_TOKEN)
     except Exception as e: print(f"An error occurred: {e}", file=sys.stderr); traceback.print_exc()
     finally: print("DEBUG: Bot run loop finished or encountered an error.")
-
