@@ -157,6 +157,7 @@ async def save_guild_config(guild_id, guild_config_data):
      server_configs[guild_id]['hash_db_file'] = f"{HASH_FILENAME_PREFIX}{guild_id}.json"
      return await save_main_config()
 
+
 # --- Hashing and File I/O Functions ---
 
 def get_hash_file_lock(guild_id):
@@ -228,7 +229,7 @@ def find_hash_exists_sync(target_hash, stored_hashes_dict, threshold, scope, cha
             stored_hash = imagehash.hex_to_hash(stored_hash_str)
             if (target_hash - stored_hash) <= threshold: return True # Found similar
         except ValueError: pass
-        except Exception as e: print(f"DEBUG: Error comparing hash for '{identifier}': {e}", file=sys.stderr)
+        except Exception as e: print(f"DEBUG: Error comparing hash for identifier '{identifier}': {e}", file=sys.stderr)
     return False
 
 def find_duplicates_sync(new_image_hash, stored_hashes_dict, threshold, scope, channel_id_str, check_duration_days):
@@ -255,8 +256,8 @@ def find_duplicates_sync(new_image_hash, stored_hashes_dict, threshold, scope, c
             try:
                 stored_time = dateutil.parser.isoparse(timestamp_str)
                 if stored_time.tzinfo is None: stored_time = stored_time.replace(tzinfo=datetime.timezone.utc)
-                if (now - stored_time).days > check_duration_days: continue
-            except Exception: pass
+                if (now - stored_time).days > check_duration_days: continue # Skip if too old
+            except Exception: pass # Ignore errors, don't time limit if parse fails
         # Hash Comparison
         try:
             stored_hash = imagehash.hex_to_hash(stored_hash_str)
@@ -295,7 +296,7 @@ async def on_ready():
     print(f'--- Logged in as {bot.user.name} (ID: {bot.user.id}) ---'); print(f'--- Command Prefix: {bot.command_prefix} ---')
     await load_main_config()
     print(f'--- Ready for {len(bot.guilds)} guilds ---')
-    for guild in bot.guilds: _ = get_guild_config(guild.id)
+    for guild in bot.guilds: _ = get_guild_config(guild.id) # Ensure configs exist
     print('------')
 
 @bot.event
@@ -313,7 +314,6 @@ async def on_message(message):
     current_user_id = message.author.id
     allowed_users = guild_config.get('allowed_users', [])
     if current_user_id in allowed_users:
-        # print(f"DEBUG: [G:{guild_id}] User {current_user_id} is allowlisted. Skipping checks.") # Optional debug
         # Still process commands even if allowlisted
         await bot.process_commands(message)
         return # Skip duplicate checking entirely
@@ -378,10 +378,25 @@ async def on_message(message):
                          try: jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"; reply_text += f"\nOriginal: {jump_url}"
                          except: pass
                     await message.reply(reply_text, mention_author=True)
-                    if react_to_duplicates: try: await message.add_reaction(duplicate_reaction_emoji); except: pass
+
+                    # --- Action: React ---
+                    if react_to_duplicates:
+                        # Needs to be on a new line
+                        try:
+                            await message.add_reaction(duplicate_reaction_emoji)
+                        except Exception as e:
+                            print(f"DEBUG: [G:{guild_id}] Failed reaction: {e}")
+
+                    # --- Action: Delete ---
                     if delete_duplicates:
-                        if message.channel.permissions_for(message.guild.me).manage_messages: try: await message.delete(); except: pass
-                        else: print(f"DEBUG: [G:{guild_id}] Lacking 'Manage Messages' permission.")
+                        # Needs to be on a new line
+                        if message.channel.permissions_for(message.guild.me).manage_messages:
+                            try:
+                                await message.delete()
+                            except Exception as e:
+                                print(f"DEBUG: [G:{guild_id}] Failed delete: {e}")
+                        else:
+                            print(f"DEBUG: [G:{guild_id}] Lacking 'Manage Messages' permission.")
 
                 # --- Add Unique Hash (if no violation) ---
                 elif not is_violation:
@@ -459,7 +474,14 @@ async def config_set(ctx, setting: str, *, value: str):
             if value.lower() in ['true', 'on', 'yes', '1', 'enable', 'enabled']: new_value = True
             elif value.lower() in ['false', 'off', 'no', '0', 'disable', 'disabled']: new_value = False
             else: error_msg = "Value must be true/false (or on/off, etc.)."
-        elif setting == 'duplicate_reaction_emoji': try: await ctx.message.add_reaction(value); await ctx.message.remove_reaction(value, ctx.me); new_value = value; except: error_msg = "Invalid emoji."
+        elif setting == 'duplicate_reaction_emoji':
+            # Needs to be on a new line
+            try:
+                await ctx.message.add_reaction(value)
+                await ctx.message.remove_reaction(value, ctx.me)
+                new_value = value
+            except:
+                error_msg = "Invalid emoji."
     except (ValueError, AssertionError): error_msg = f"Invalid value format/range for '{setting}'."
     except Exception as e: error_msg = f"Unexpected validation error: {e}"
     if error_msg: await ctx.send(f"❌ Error setting '{setting}': {error_msg}"); return
@@ -538,10 +560,13 @@ async def allowlistcmd(ctx):
 
     if user_list:
         embed = discord.Embed(title=f"Allowlisted Users for {ctx.guild.name}", color=discord.Color.green())
-        # Try to fetch user objects for mentions, fallback to ID if user not found/cached
         mentions = []
         for user_id in user_list:
-            user = bot.get_user(user_id) or await bot.fetch_user(user_id) # Fetch if not cached
+            # Try to fetch user for mention, fallback to ID
+            user = bot.get_user(user_id) # Check cache first
+            if not user: # Fetch if not in cache
+                 try: user = await bot.fetch_user(user_id)
+                 except discord.NotFound: user = None # User might not exist anymore
             if user: mentions.append(f"- {user.mention} (`{user_id}`)")
             else: mentions.append(f"- *Unknown User* (`{user_id}`)")
         embed.description = '\n'.join(mentions)
@@ -567,7 +592,6 @@ async def allowlist_add(ctx, user: discord.User):
     guild_config = get_guild_config(guild_id).copy()
     user_id = user.id
 
-    # Ensure the list exists
     if 'allowed_users' not in guild_config or guild_config['allowed_users'] is None:
         guild_config['allowed_users'] = []
 
@@ -605,13 +629,9 @@ async def allowlist_remove(ctx, user: discord.User):
 # Helper function to parse message link/ID
 def parse_message_id(message_ref: str) -> int | None:
     """Parses a message link or ID string into an integer ID."""
-    # Regex to find message ID in links like .../channels/guild/channel/message
     match = re.search(r'/(\d+)$', message_ref)
-    if match:
-        return int(match.group(1))
-    # Check if it's just a raw ID
-    elif message_ref.isdigit():
-        return int(message_ref)
+    if match: return int(match.group(1))
+    elif message_ref.isdigit(): return int(message_ref)
     return None
 
 # Decorators must be on separate lines
@@ -626,51 +646,40 @@ async def remove_hash(ctx, message_reference: str):
     loop = asyncio.get_running_loop()
 
     target_message_id = parse_message_id(message_reference)
-    if target_message_id is None:
-        await ctx.send("❌ Invalid message ID or link format.")
-        return
+    if target_message_id is None: await ctx.send("❌ Invalid message ID or link format."); return
 
     target_message_id_str = str(target_message_id)
     stored_hashes = await load_guild_hashes(guild_id, loop)
-    hash_removed = False
-    key_to_remove = None
+    hash_removed = False; key_to_remove = None; channel_key = None
 
-    if not isinstance(stored_hashes, dict):
-        await ctx.send("ℹ️ Hash database is empty or invalid.")
-        return
+    if not isinstance(stored_hashes, dict): await ctx.send("ℹ️ Hash database is empty or invalid."); return
 
     # Find the key associated with the message ID
     if current_scope == "server":
         for identifier in stored_hashes.keys():
             if identifier.startswith(target_message_id_str + "-"):
-                key_to_remove = identifier
-                break
-        if key_to_remove:
-            del stored_hashes[key_to_remove]
-            hash_removed = True
-
+                key_to_remove = identifier; break
+        if key_to_remove: del stored_hashes[key_to_remove]; hash_removed = True
     elif current_scope == "channel":
-        for channel_id_str, channel_hashes in stored_hashes.items():
+        for ch_id_str, channel_hashes in stored_hashes.items():
             if isinstance(channel_hashes, dict):
                  for identifier in channel_hashes.keys():
                       if identifier.startswith(target_message_id_str + "-"):
-                           key_to_remove = identifier
-                           del channel_hashes[key_to_remove] # Remove from nested dict
-                           hash_removed = True
-                           break # Assume only one entry per message ID
-            if hash_removed: break # Stop searching channels
+                           key_to_remove = identifier; channel_key = ch_id_str; break
+            if key_to_remove: break
+        if key_to_remove and channel_key:
+             del stored_hashes[channel_key][key_to_remove]; hash_removed = True
+             # Optional: remove channel key if it becomes empty
+             if not stored_hashes[channel_key]: del stored_hashes[channel_key]
 
     # Save if removal occurred
     if hash_removed:
-        if await save_guild_hashes(guild_id, stored_hashes, loop):
-            await ctx.send(f"✅ Removed hash entry associated with message ID `{target_message_id}`.")
-        else:
-            await ctx.send("⚠️ Error saving updated hash database after removal.")
-    else:
-        await ctx.send(f"ℹ️ No hash entry found for message ID `{target_message_id}`.")
+        if await save_guild_hashes(guild_id, stored_hashes, loop): await ctx.send(f"✅ Removed hash entry for message ID `{target_message_id}`.")
+        else: await ctx.send("⚠️ Error saving updated hash database.")
+    else: await ctx.send(f"ℹ️ No hash entry found for message ID `{target_message_id}`.")
 
 # Decorators must be on separate lines
-@bot.command(name='clearhashes', help="Clears hashes for the server or a specific channel. Requires confirmation.")
+@bot.command(name='clearhashes', help="Clears hashes for the server or a channel. Requires confirmation.")
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
 async def clear_hashes(ctx, channel: typing.Optional[discord.TextChannel] = None, *, confirmation: str = ""):
@@ -682,10 +691,7 @@ async def clear_hashes(ctx, channel: typing.Optional[discord.TextChannel] = None
 
     if confirmation.lower() != '--confirm':
         cmd = f"`!clearhashes {f'#{channel.name} ' if channel else ''}--confirm`"
-        await ctx.send(f"🛑 **Warning:** This will permanently delete stored hashes. "
-                       f"To proceed, please run the command again with `--confirm` at the end.\n"
-                       f"Example: {cmd}")
-        return
+        await ctx.send(f"🛑 **Warning:** This permanently deletes hashes. To proceed, run again with `--confirm`.\nExample: {cmd}"); return
 
     target_desc = f"channel <#{channel.id}>" if channel else "the entire server"
     status_msg = await ctx.send(f"⏳ Clearing hashes for {target_desc}...")
@@ -693,38 +699,23 @@ async def clear_hashes(ctx, channel: typing.Optional[discord.TextChannel] = None
     stored_hashes = await load_guild_hashes(guild_id, loop)
     cleared = False
 
-    if not isinstance(stored_hashes, dict):
-         await status_msg.edit(content=f"ℹ️ Hash database is already empty or invalid for {target_desc}.")
-         return
+    if not isinstance(stored_hashes, dict): await status_msg.edit(content=f"ℹ️ Hash database empty/invalid for {target_desc}."); return
 
-    if channel:
-        # Clear specific channel
+    if channel: # Clear specific channel
         target_channel_id_str = str(channel.id)
         if current_scope == "channel":
             if target_channel_id_str in stored_hashes:
-                del stored_hashes[target_channel_id_str]
-                cleared = True
-            else:
-                 await status_msg.edit(content=f"ℹ️ No hashes found specifically for channel <#{channel.id}> (Scope is 'channel').")
-                 return # No need to save if nothing changed
-        elif current_scope == "server":
-             await status_msg.edit(content=f"ℹ️ Cannot clear specific channel when scope is 'server'. Use `!clearhashes --confirm` to clear all server hashes.")
-             return # Don't proceed
-    else:
-        # Clear all hashes for the guild
-        stored_hashes.clear()
-        cleared = True
+                del stored_hashes[target_channel_id_str]; cleared = True
+            else: await status_msg.edit(content=f"ℹ️ No hashes found for <#{channel.id}> (Scope is 'channel')."); return
+        elif current_scope == "server": await status_msg.edit(content=f"ℹ️ Cannot clear specific channel when scope is 'server'. Use `!clearhashes --confirm`."); return
+    else: # Clear all for guild
+        stored_hashes.clear(); cleared = True
 
     if cleared:
-        if await save_guild_hashes(guild_id, stored_hashes, loop):
-            await status_msg.edit(content=f"✅ Successfully cleared hashes for {target_desc}.")
-        else:
-            await status_msg.edit(content=f"⚠️ Error saving cleared hash database for {target_desc}.")
-    # else: # Message already sent if channel not found or scope mismatch
-    #     pass
+        if await save_guild_hashes(guild_id, stored_hashes, loop): await status_msg.edit(content=f"✅ Cleared hashes for {target_desc}.")
+        else: await status_msg.edit(content=f"⚠️ Error saving cleared hash database.")
 
-
-# --- Scan Command (Unchanged from previous version) ---
+# Decorators must be on separate lines
 @bot.command(name='scan', help="Scans channel history to add unique image hashes. Usage: !scan <#channel> [limit]")
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
@@ -741,7 +732,15 @@ async def scan_history(ctx, channel: discord.TextChannel, limit: typing.Optional
     try:
         async for message in channel.history(limit=limit):
             processed_messages += 1
-            if processed_messages % SCAN_UPDATE_INTERVAL == 0: try: await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit}. Added {added_hashes} new hashes."); except: pass
+            # Update status periodically - needs try/except on new line
+            if processed_messages % SCAN_UPDATE_INTERVAL == 0:
+                try:
+                    await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit}. Added {added_hashes} new hashes.")
+                except discord.HTTPException:
+                    pass # Ignore if editing fails (e.g., rate limit, message deleted)
+                except Exception as e:
+                    print(f"DEBUG: Error editing status message: {e}") # Log other potential errors
+
             if message.author.bot or not message.attachments: continue
             message_user_id = message.author.id; message_timestamp_iso = message.created_at.replace(tzinfo=datetime.timezone.utc).isoformat()
             for attachment in message.attachments:
