@@ -639,8 +639,8 @@ async def scan_history(
         channel: discord.Option(discord.TextChannel, "The channel to scan."),
         limit: discord.Option(int, "Max number of messages to scan.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT),
         flag_duplicates: discord.Option(bool, "Add reaction to non-oldest duplicates found?", default=False),
-        reply_to_duplicates: discord.Option(bool, "Reply to non-oldest duplicates found?", default=False), # New option
-        delete_duplicates: discord.Option(bool, "Delete non-oldest duplicates found? (Requires Manage Messages)", default=False) # New option
+        reply_to_duplicates: discord.Option(bool, "Reply to non-oldest duplicates found?", default=False),
+        delete_duplicates: discord.Option(bool, "Delete non-oldest duplicates found? (Requires Manage Messages)", default=False)
 ):
     """Scans past messages, populates DB (finds oldest), optionally flags/replies/deletes non-oldest duplicates."""
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
@@ -649,7 +649,6 @@ async def scan_history(
     guild_id = interaction.guild_id; scan_channel_id = channel.id; scan_channel_id_str = str(scan_channel_id)
     guild_config = get_guild_config(guild_id); current_scope = guild_config.get('duplicate_scope', 'server')
     current_hash_size = guild_config.get('hash_size', 8); existence_threshold = 0
-    # Get settings needed for flagging/replying/deleting logic
     current_mode = guild_config.get('duplicate_check_mode', 'strict')
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
     current_duration = guild_config.get('duplicate_check_duration_days', 0)
@@ -658,82 +657,59 @@ async def scan_history(
     bot_member = interaction.guild.me
     if not channel.permissions_for(bot_member).read_message_history:
         await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
-    # Check permissions needed for actions if requested
     perms_needed = []
     if flag_duplicates and not channel.permissions_for(bot_member).add_reactions: perms_needed.append("Add Reactions")
     if reply_to_duplicates and not channel.permissions_for(bot_member).send_messages: perms_needed.append("Send Messages")
     if delete_duplicates and not channel.permissions_for(bot_member).manage_messages: perms_needed.append("Manage Messages")
     if perms_needed:
-        await interaction.response.send_message(f"❌ Bot lacks necessary permissions ({', '.join(perms_needed)}) in {channel.mention} for requested actions.", ephemeral=True); return
+        await interaction.response.send_message(f"❌ Bot lacks permissions ({', '.join(perms_needed)}) in {channel.mention} for requested actions.", ephemeral=True); return
 
-    await interaction.response.defer(ephemeral=False) # Public deferral
+    await interaction.response.defer(ephemeral=False)
     status_message = await interaction.followup.send(f"⏳ Starting scan: {channel.mention}, limit={limit}, Flagging:{flag_duplicates}, Replying:{reply_to_duplicates}, Deleting:{delete_duplicates}...", wait=True)
 
     processed_messages = 0; added_hashes = 0; updated_hashes = 0; flagged_count = 0; replied_count = 0; deleted_count = 0
     skipped_attachments = 0; errors = 0
     loop = asyncio.get_running_loop()
 
-    # --- Phase 1: Gather all image data from history ---
+    # --- Phase 1: Gather all image data ---
     scanned_image_data = defaultdict(list)
-    print(f"DEBUG: [Scan G:{guild_id}] Starting phase 1: Gathering image data...")
+    print(f"DEBUG: [Scan G:{guild_id}] Phase 1: Gathering image data...")
     try:
         async for message in channel.history(limit=limit):
             processed_messages += 1
             if processed_messages % SCAN_UPDATE_INTERVAL == 0:
-                try: await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit} messages (Phase 1: Gathering).")
-                except Exception as e: print(f"DEBUG: Error editing status message: {e}")
-
+                try: await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit} (Phase 1).")
+                except Exception as e: print(f"DEBUG: Error editing status: {e}")
             if message.author.bot or not message.attachments: continue
-            message_user_id = message.author.id
-            message_timestamp = message.created_at.replace(tzinfo=datetime.timezone.utc)
-
+            message_user_id = message.author.id; message_timestamp = message.created_at.replace(tzinfo=datetime.timezone.utc)
             for attachment in message.attachments:
                 if attachment.content_type and attachment.content_type.startswith('image/'):
                     try:
-                        image_bytes = await attachment.read()
-                        img_hash = await calculate_hash(image_bytes, current_hash_size, loop)
+                        image_bytes = await attachment.read(); img_hash = await calculate_hash(image_bytes, current_hash_size, loop)
                         if img_hash is None: skipped_attachments += 1; continue
-                        scanned_image_data[str(img_hash)].append(
-                            (message_timestamp, message.id, message_user_id, attachment.filename, message)
-                        )
+                        scanned_image_data[str(img_hash)].append((message_timestamp, message.id, message_user_id, attachment.filename, message))
                     except discord.HTTPException as e: print(f"Warning: [Scan G:{guild_id}] Failed download {attachment.id}: {e}"); errors += 1; skipped_attachments += 1
                     except Exception as e: print(f"Error: [Scan G:{guild_id}] Error processing attach {attachment.id}: {e}"); errors += 1; skipped_attachments += 1; traceback.print_exc()
-
     except discord.Forbidden: await status_message.edit(content=f"❌ Scan failed (Phase 1). Bot lacks permissions in {channel.mention}."); return
     except Exception as e: await status_message.edit(content=f"❌ Error during scan (Phase 1): {e}"); traceback.print_exc(); return
+    print(f"DEBUG: [Scan G:{guild_id}] Phase 1 complete. Found {len(scanned_image_data)} unique hash groups.")
 
-    print(f"DEBUG: [Scan G:{guild_id}] Phase 1 complete. Found {len(scanned_image_data)} unique hashes across {processed_messages} messages.")
-
-    # --- Phase 2: Process hashes, update DB with oldest, and flag/reply/delete duplicates ---
-    await status_message.edit(content=f"⏳ Processing {len(scanned_image_data)} unique hashes found...")
-    stored_hashes = await load_guild_hashes(guild_id, loop) # Load DB state *before* updates
-    db_updated = False
-    processed_hashes = 0
-
+    # --- Phase 2: Process hashes ---
+    await status_message.edit(content=f"⏳ Processing {len(scanned_image_data)} unique hash groups...")
+    stored_hashes = await load_guild_hashes(guild_id, loop); db_updated = False; processed_hashes = 0
     for img_hash_str, entries in scanned_image_data.items():
         processed_hashes += 1
         if processed_hashes % SCAN_UPDATE_INTERVAL == 0:
             try: await status_message.edit(content=f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes} Updated:{updated_hashes} Replied:{replied_count} Flagged:{flagged_count} Deleted:{deleted_count}")
-            except Exception as e: print(f"DEBUG: Error editing status message: {e}")
-
+            except Exception as e: print(f"DEBUG: Error editing status: {e}")
         if not entries: continue
-
-        entries.sort(key=lambda x: x[0]) # Sort by timestamp
-        oldest_entry = entries[0]
+        entries.sort(key=lambda x: x[0]); oldest_entry = entries[0]
         oldest_timestamp, oldest_msg_id, oldest_user_id, oldest_filename, oldest_message_obj = oldest_entry
-
         oldest_identifier = f"{oldest_msg_id}-{oldest_filename}"
         oldest_hash_data = {"hash": img_hash_str, "user_id": oldest_user_id, "timestamp": oldest_timestamp.isoformat()}
-
         img_hash_obj = imagehash.hex_to_hash(img_hash_str)
-        existing_identifier, existing_data = find_existing_hash_entry_sync(
-            img_hash_obj, stored_hashes, existence_threshold, current_scope, scan_channel_id_str
-        )
-
-        update_needed = False
-        identifier_to_use = oldest_identifier
-        data_to_use = oldest_hash_data
-
+        existing_identifier, existing_data = find_existing_hash_entry_sync(img_hash_obj, stored_hashes, existence_threshold, current_scope, scan_channel_id_str)
+        update_needed = False; identifier_to_use = oldest_identifier; data_to_use = oldest_hash_data
         if existing_identifier:
             existing_timestamp_str = None
             if isinstance(existing_data, dict): existing_timestamp_str = existing_data.get('timestamp')
@@ -741,15 +717,11 @@ async def scan_history(
                 try:
                     existing_time = dateutil.parser.isoparse(existing_timestamp_str)
                     if existing_time.tzinfo is None: existing_time = existing_time.replace(tzinfo=datetime.timezone.utc)
-                    if oldest_timestamp < existing_time:
-                        update_needed = True; updated_hashes += 1
-                        # print(f"DEBUG: [Scan G:{guild_id}] Found older message ({oldest_msg_id}). Updating entry {existing_identifier}.")
+                    if oldest_timestamp < existing_time: update_needed = True; updated_hashes += 1
                     else: identifier_to_use = existing_identifier; data_to_use = existing_data if isinstance(existing_data, dict) else {"hash": existing_data, "user_id": None, "timestamp": None}
                 except Exception: pass
-        else:
-            update_needed = True; added_hashes += 1
-
-        # --- Perform DB Update/Add if needed ---
+        else: update_needed = True; added_hashes += 1
+        # DB Update/Add
         if update_needed:
             db_updated = True
             if current_scope == "server":
@@ -762,78 +734,117 @@ async def scan_history(
                 if not isinstance(channel_hashes, dict): channel_hashes = {}; stored_hashes[scan_channel_id_str] = channel_hashes
                 if existing_identifier and existing_identifier != identifier_to_use: channel_hashes.pop(existing_identifier, None)
                 channel_hashes[identifier_to_use] = data_to_use
-
-        # --- Flagging/Replying/Deleting Logic (if enabled) ---
-        # Iterate through all entries found for this hash *except* the oldest one
+        # Flagging/Replying/Deleting Logic
         for entry_timestamp, entry_msg_id, entry_user_id, entry_filename, entry_message_obj in entries:
-            if entry_msg_id == oldest_msg_id: continue # Don't act on the oldest
-
-            # Check if this non-oldest entry constitutes a violation
+            if entry_msg_id == oldest_msg_id: continue
             is_violation = False
             if current_mode == "strict": is_violation = True
             elif current_mode == "owner_allowed":
                 if oldest_user_id is None or oldest_user_id != entry_user_id: is_violation = True
-
-            # Also check time duration against the oldest entry's timestamp
             if is_violation and current_duration > 0:
                 if (entry_timestamp - oldest_timestamp).days > current_duration: is_violation = False
-
             if is_violation:
-                action_taken = False # Flag to add delay only if an action was attempted
-
-                # --- Perform Reply (if enabled) ---
+                action_taken = False
+                # Reply
                 if reply_to_duplicates:
                     try:
-                        reply_text = f"{duplicate_reaction_emoji} Similar image found (Ref: `{oldest_identifier}`, User: <@{oldest_user_id}>)"
-                        await entry_message_obj.reply(reply_text, mention_author=False, fail_if_not_exists=False)
-                        replied_count += 1
-                        action_taken = True
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages permission.")
-                    except Exception as e_reply: print(f"DEBUG: [Scan Action G:{guild_id}] Failed to reply to {entry_msg_id}: {e_reply}")
-
-                # --- Perform Reaction (if enabled) ---
+                        reply_text = f"{duplicate_reaction_emoji} Similar image found (Ref Scan: `{oldest_identifier}`, User: <@{oldest_user_id}>)"
+                        # CORRECTED: Removed invalid argument
+                        await entry_message_obj.reply(reply_text, mention_author=False)
+                        replied_count += 1; action_taken = True
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages perm.")
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reply.")
+                    except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed reply to {entry_msg_id}: {e}")
+                # React
                 if flag_duplicates:
                     try:
-                        # Check if reaction already exists
-                        already_reacted = False
-                        # Fetch fresh message object to get current reactions
-                        refreshed_message = await channel.fetch_message(entry_message_obj.id)
+                        already_reacted = False; refreshed_message = await channel.fetch_message(entry_message_obj.id)
                         for reaction in refreshed_message.reactions:
-                            if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me:
-                                already_reacted = True; break
-                        if not already_reacted:
-                            await entry_message_obj.add_reaction(duplicate_reaction_emoji)
-                            flagged_count += 1
-                            action_taken = True # Mark action taken even if only reaction
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Add Reactions permission."); # Maybe stop trying reactions for this channel?
-                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Message {entry_msg_id} not found for reaction.")
-                    except Exception as e_react: print(f"DEBUG: [Scan Action G:{guild_id}] Failed to add reaction: {e_react}")
-
-                # --- Perform Delete (if enabled) ---
+                            if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me: already_reacted = True; break
+                        if not already_reacted: await entry_message_obj.add_reaction(duplicate_reaction_emoji); flagged_count += 1; action_taken = True
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Add Reactions perm."); break
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reaction.")
+                    except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed reaction: {e}")
+                # Delete
                 if delete_duplicates:
-                    try:
-                        await entry_message_obj.delete()
-                        deleted_count += 1
-                        action_taken = True
-                        print(f"DEBUG: [Scan Action G:{guild_id}] Deleted message {entry_msg_id}")
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Manage Messages permission.")
-                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Message {entry_msg_id} not found for deletion.")
-                    except Exception as e_delete: print(f"DEBUG: [Scan Action G:{guild_id}] Failed to delete message {entry_msg_id}: {e_delete}")
-
-
-                # Add delay only if an action was attempted to prevent spamming API
-                if action_taken:
-                    await asyncio.sleep(SCAN_ACTION_DELAY)
-
-
-    # --- Final Save and Report ---
+                    try: await entry_message_obj.delete(); deleted_count += 1; action_taken = True; print(f"DEBUG: [Scan Action G:{guild_id}] Deleted msg {entry_msg_id}")
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Manage Messages perm.")
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for deletion.")
+                    except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed delete msg {entry_msg_id}: {e}")
+                # Delay
+                if action_taken: await asyncio.sleep(SCAN_ACTION_DELAY)
+    # Final Save and Report
     if db_updated:
         print(f"DEBUG: [Scan G:{guild_id}] Saving updated hash database after scan...")
         if not await save_guild_hashes(guild_id, stored_hashes, loop):
             try: await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
             except: pass
-
     await status_message.edit(content=f"✅ Scan Complete! Processed {processed_messages}. Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, Flagged:{flagged_count}, Deleted:{deleted_count}. Skipped:{skipped_attachments}. Errors:{errors}.")
+
+
+# --- New Clear Flags Command ---
+@bot.slash_command(name="clearflags", description="Removes the bot's duplicate warning reactions from messages in a channel.")
+async def clear_flags(
+        interaction: discord.Interaction,
+        channel: discord.Option(discord.TextChannel, "The channel to clear reactions from."),
+        confirm: discord.Option(bool, "Must be True to confirm clearing reactions.", required=True), # Required comes first
+        limit: discord.Option(int, "Max number of messages to check.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT) # Optional comes last
+):
+    """Removes the bot's configured duplicate reaction from messages in channel history."""
+    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
+    if not confirm: await interaction.response.send_message(f"🛑 **Confirmation required!** Set `confirm:True` to proceed.", ephemeral=True); return
+
+    guild_id = interaction.guild_id
+    guild_config = get_guild_config(guild_id)
+    duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
+    # CORRECTED: Define bot_member using interaction.guild.me
+    bot_member = interaction.guild.me # Get the bot's Member object in this guild
+
+    # Check permissions
+    if not channel.permissions_for(bot_member).read_message_history:
+        await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
+    if not channel.permissions_for(bot_member).add_reactions: # Need Add Reactions to remove own reactions
+        print(f"Warning: [ClearFlags G:{guild_id}] Bot might lack Add Reactions permission needed to remove reactions in {channel.mention}.")
+        # Proceed anyway, try/except will handle actual failures
+
+    await interaction.response.defer(ephemeral=False) # Public deferral
+    status_message = await interaction.followup.send(f"⏳ Starting reaction cleanup in {channel.mention} (limit {limit})...", wait=True)
+
+    processed_msgs = 0
+    reactions_removed = 0
+    errors = 0
+
+    try:
+        async for message in channel.history(limit=limit):
+            processed_msgs += 1
+            if processed_msgs % SCAN_UPDATE_INTERVAL == 0:
+                try: await status_message.edit(content=f"⏳ Clearing flags... Checked {processed_msgs}/{limit}. Removed {reactions_removed}.")
+                except Exception as e: print(f"DEBUG: Error editing status: {e}")
+
+            # Check reactions on the message
+            for reaction in message.reactions:
+                # Is it the configured emoji AND was it added by the bot itself?
+                if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me:
+                    try:
+                        # CORRECTED: Use bot_member variable here
+                        await message.remove_reaction(duplicate_reaction_emoji, bot_member)
+                        reactions_removed += 1
+                        await asyncio.sleep(CLEAR_REACTION_DELAY) # Delay between removals
+                    except discord.Forbidden:
+                        print(f"Warning: [ClearFlags G:{guild_id}] Missing permission to remove reaction in {channel.mention}.")
+                        # Stop trying if permission denied once? Or keep trying per message? Keep trying for now.
+                    except discord.NotFound:
+                        print(f"Warning: [ClearFlags G:{guild_id}] Message {message.id} or reaction not found.")
+                    except Exception as e:
+                        print(f"Error: [ClearFlags G:{guild_id}] Failed to remove reaction from {message.id}: {e}")
+                        errors += 1
+                    break # Move to next message once bot's reaction is found/handled
+
+    except discord.Forbidden: await status_message.edit(content=f"❌ Cleanup failed. Bot lacks permissions in {channel.mention}."); return
+    except Exception as e: await status_message.edit(content=f"❌ Error during cleanup: {e}"); traceback.print_exc(); return
+
+    await status_message.edit(content=f"✅ Cleanup Complete! Checked {processed_msgs} messages in {channel.mention}. Removed **{reactions_removed}** reactions. Errors: {errors}.")
 
 
 # --- Main Execution ---
