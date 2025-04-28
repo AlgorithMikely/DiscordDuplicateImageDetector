@@ -1,3 +1,20 @@
-/hashes_1288939910530727968.json
-/server_configs.json
-/.env
+# Environment variables
+.env
+
+# Python cache/compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment folders (if you use one)
+venv/
+env/
+.venv/
+
+# Configuration/Data files (Optional - if you don't want to share them)
+server_configs.json
+hashes_*.json
+hashes_1288939910530727968.json
+server_configs.json
+.env
