@@ -40,7 +40,7 @@ The bot uses perceptual hashing (specifically, dhash) to compare images based on
 
 ## Installation and Setup
 
-1.  **Get the Code:** Download or clone the Python script (e.g., `discord_checker_bot.py`) and the `requirements.txt` file.
+1.  **Get the Code:** Download or clone the Python script (e.g., `discord_duplicate_bot_v3.py`) and the `requirements.txt` file.
 2.  **Install Libraries:** Open your terminal or command prompt in the script's directory and run:
     ```bash
     pip install -r requirements.txt
