@@ -4,9 +4,9 @@
 """
 Discord bot to detect duplicate images using Slash Commands.
 Supports per-server configuration, scope, check mode, time limits,
-history scanning (/scan - finds oldest, optionally flags/replies/deletes non-oldest),
-hash management (/hash_remove, /hash_clear), user allowlisting (/allowlist_add etc.),
-retroactive flag clearing (/clearflags), and configurable reply messages.
+history scanning (/scan), hash management, user allowlisting,
+retroactive flag clearing (/clearflags), configurable replies (with on/off switch),
+and logging to a designated channel.
 Loads token from .env, settings from server_configs.json.
 Requires discord.py v2.x (Pycord)
 """
@@ -47,7 +47,9 @@ CLEAR_REACTION_DELAY = 0.2 # Delay for clearing reactions
 # {identifier}: The internal identifier for the matched original image (message_id-filename).
 # {distance}: The hash distance (similarity score) between the images.
 # {original_user_mention}: Mention of the user who posted the original image (if known).
-# {jump_url}: Link to the original message (if possible).
+# {emoji}: The currently configured `duplicate_reaction_emoji`.
+# {original_user_info}: Expands to ", Orig User: <@user_id>" if the original user is known, otherwise empty string.
+# {jump_link}: Expands to "\nOriginal: <message_link>" if the original message ID is known, otherwise empty string.
 DEFAULT_REPLY_TEMPLATE = "{emoji} Hold on, {mention}! Image `{filename}` similar to recent submission (ID: `{identifier}`, Dist: {distance}{original_user_info}).{jump_link}"
 
 
@@ -63,7 +65,7 @@ hash_file_locks = {}
 # --- Configuration Loading/Saving ---
 
 def get_default_guild_config(guild_id):
-    """Returns default settings, including allowlist and reply template."""
+    """Returns default settings, including allowlist, reply template, log channel, and reply toggle."""
     return {
         "hash_db_file": f"{HASH_FILENAME_PREFIX}{guild_id}.json",
         "hash_size": 8,
@@ -71,24 +73,27 @@ def get_default_guild_config(guild_id):
         "allowed_channel_ids": None,
         "react_to_duplicates": True,
         "delete_duplicates": False,
+        "reply_on_duplicate": True, # New setting to toggle replies on/off
         "duplicate_reaction_emoji": "⚠️",
         "duplicate_scope": "server",
         "duplicate_check_mode": "strict",
         "duplicate_check_duration_days": 0, # 0 = check forever
         "allowed_users": [], # List of user IDs exempt from checks
-        "duplicate_reply_template": DEFAULT_REPLY_TEMPLATE # New setting
+        "duplicate_reply_template": DEFAULT_REPLY_TEMPLATE,
+        "log_channel_id": None # New setting for logging channel
     }
 
 def validate_config_data(config_data):
-    """Validates config, including new fields."""
-    validated = get_default_guild_config(0).copy()
-    validated.update(config_data)
-    try:
+     """Validates config, including new fields."""
+     validated = get_default_guild_config(0).copy()
+     validated.update(config_data)
+     try:
         # Coerce types
         validated['hash_size'] = int(validated['hash_size'])
         validated['similarity_threshold'] = int(validated['similarity_threshold'])
         validated['react_to_duplicates'] = bool(validated['react_to_duplicates'])
         validated['delete_duplicates'] = bool(validated['delete_duplicates'])
+        validated['reply_on_duplicate'] = bool(validated.get('reply_on_duplicate', True)) # Validate new setting
         validated['duplicate_check_duration_days'] = int(validated.get('duplicate_check_duration_days', 0))
         if validated['duplicate_check_duration_days'] < 0: validated['duplicate_check_duration_days'] = 0
 
@@ -99,23 +104,29 @@ def validate_config_data(config_data):
         # Validate allowed_channel_ids (list of ints or None)
         if validated['allowed_channel_ids'] is not None:
             if isinstance(validated['allowed_channel_ids'], list):
-                validated['allowed_channel_ids'] = [int(ch_id) for ch_id in validated['allowed_channel_ids'] if str(ch_id).isdigit()]
-                if not validated['allowed_channel_ids']: validated['allowed_channel_ids'] = None
+                 validated['allowed_channel_ids'] = [int(ch_id) for ch_id in validated['allowed_channel_ids'] if str(ch_id).isdigit()]
+                 if not validated['allowed_channel_ids']: validated['allowed_channel_ids'] = None
             else: validated['allowed_channel_ids'] = None
 
         # Validate allowed_users (list of ints or empty list)
         if 'allowed_users' not in validated or not isinstance(validated['allowed_users'], list):
-            validated['allowed_users'] = []
+             validated['allowed_users'] = []
         else:
-            validated['allowed_users'] = [int(u_id) for u_id in validated['allowed_users'] if str(u_id).isdigit()]
+             validated['allowed_users'] = [int(u_id) for u_id in validated['allowed_users'] if str(u_id).isdigit()]
 
         # Ensure reply template is a string
         if not isinstance(validated.get('duplicate_reply_template'), str):
-            validated['duplicate_reply_template'] = DEFAULT_REPLY_TEMPLATE
+             validated['duplicate_reply_template'] = DEFAULT_REPLY_TEMPLATE
 
-    except (ValueError, TypeError, KeyError) as e:
-        print(f"Warning: Error validating config types/keys: {e}. Some defaults may be used.", file=sys.stderr)
-    return validated
+        # Validate log_channel_id (must be int or None)
+        log_id = validated.get('log_channel_id')
+        if log_id is not None:
+            try: validated['log_channel_id'] = int(log_id)
+            except (ValueError, TypeError): validated['log_channel_id'] = None
+
+     except (ValueError, TypeError, KeyError) as e:
+          print(f"Warning: Error validating config types/keys: {e}. Some defaults may be used.", file=sys.stderr)
+     return validated
 
 async def load_main_config():
     """Loads the main server_configs.json file."""
@@ -162,21 +173,21 @@ def get_guild_config(guild_id):
         for key, default_value in default_conf.items():
             # Ensure all default keys exist in the loaded config
             if key not in guild_conf:
-                guild_conf[key] = default_value; updated = True
+                 guild_conf[key] = default_value; updated = True
         if updated:
-            # If keys were added, re-validate the whole config dict
-            server_configs[guild_id] = validate_config_data(guild_conf)
-            defaults_needed = True # Mark that save is needed
+             # If keys were added, re-validate the whole config dict
+             server_configs[guild_id] = validate_config_data(guild_conf)
+             defaults_needed = True # Mark that save is needed
 
     if defaults_needed: asyncio.create_task(save_main_config()) # Save if defaults added/updated
     return server_configs[guild_id]
 
 async def save_guild_config(guild_id, guild_config_data):
-    """Updates guild config and saves main file."""
-    global server_configs
-    server_configs[guild_id] = validate_config_data(guild_config_data)
-    server_configs[guild_id]['hash_db_file'] = f"{HASH_FILENAME_PREFIX}{guild_id}.json"
-    return await save_main_config()
+     """Updates guild config and saves main file."""
+     global server_configs
+     server_configs[guild_id] = validate_config_data(guild_config_data)
+     server_configs[guild_id]['hash_db_file'] = f"{HASH_FILENAME_PREFIX}{guild_id}.json"
+     return await save_main_config()
 
 
 # --- Hashing and File I/O Functions (Remain the same) ---
@@ -303,6 +314,32 @@ async def find_duplicates(new_image_hash, stored_hashes_dict, threshold, scope, 
     duplicates = await loop.run_in_executor(None, func)
     return duplicates
 
+# --- Logging Helper ---
+async def log_event(guild: discord.Guild, embed: discord.Embed):
+    """Sends an embed message to the configured log channel."""
+    if not guild: return # Cannot log without guild context
+    guild_config = get_guild_config(guild.id)
+    log_channel_id = guild_config.get('log_channel_id')
+
+    if log_channel_id:
+        try:
+            log_channel = bot.get_channel(log_channel_id) or await bot.fetch_channel(log_channel_id)
+            if isinstance(log_channel, discord.TextChannel):
+                 # Check permissions before sending
+                 if log_channel.permissions_for(guild.me).send_messages and log_channel.permissions_for(guild.me).embed_links:
+                      await log_channel.send(embed=embed)
+                 else:
+                      print(f"Warning: [G:{guild.id}] Missing Send Messages/Embed Links permission in log channel {log_channel_id}.")
+            else:
+                 print(f"Warning: [G:{guild.id}] Configured log channel {log_channel_id} is not a text channel.")
+        except discord.NotFound:
+            print(f"Warning: [G:{guild.id}] Configured log channel {log_channel_id} not found.")
+        except discord.Forbidden:
+            print(f"Warning: [G:{guild.id}] Bot lacks permission to access log channel {log_channel_id}.")
+        except Exception as e:
+            print(f"Error: [G:{guild.id}] Failed to send log message to channel {log_channel_id}: {e}")
+
+
 # --- Discord Bot Implementation ---
 intents = discord.Intents.default(); intents.message_content = True; intents.guilds = True; intents.members = True; intents.reactions = True
 bot = discord.Bot(intents=intents)
@@ -323,7 +360,7 @@ async def on_ready():
 
 @bot.event
 async def on_guild_join(guild):
-    print(f"Joined new guild: {guild.name} (ID: {guild.id})"); _ = get_guild_config(guild.id); await save_main_config()
+     print(f"Joined new guild: {guild.name} (ID: {guild.id})"); _ = get_guild_config(guild.id); await save_main_config()
 
 @bot.event
 async def on_message(message):
@@ -343,8 +380,9 @@ async def on_message(message):
     current_similarity_threshold = guild_config.get('similarity_threshold', 5)
     react_to_duplicates = guild_config.get('react_to_duplicates', True)
     delete_duplicates = guild_config.get('delete_duplicates', False)
+    reply_on_duplicate = guild_config.get('reply_on_duplicate', True) # Get new setting
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
-    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE) # Get template
+    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE)
 
     if allowed_channel_ids and channel_id not in allowed_channel_ids: return
     if not message.attachments: return
@@ -378,28 +416,57 @@ async def on_message(message):
                     identifier = violating_match['identifier']; distance = violating_match['distance']
                     original_message_id = violating_match.get('original_message_id'); original_user_id = violating_match.get('original_user_id')
 
-                    # --- Format Reply using Template ---
-                    template_data = {
-                        "mention": message.author.mention,
-                        "filename": attachment.filename,
-                        "identifier": identifier,
-                        "distance": distance,
-                        "original_user_mention": f"<@{original_user_id}>" if original_user_id else "*Unknown*",
-                        "emoji": duplicate_reaction_emoji,
-                        "original_user_info": f", Orig User: <@{original_user_id}>" if original_user_id else "", # Optional part
-                        "jump_link": "" # Placeholder for jump link
-                    }
-                    if original_message_id and message.guild:
-                        try:
-                            jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
-                            template_data["jump_link"] = f"\nOriginal: {jump_url}"
-                        except: pass # Ignore errors creating jump url
+                    # --- Send Reply (if enabled) ---
+                    if reply_on_duplicate:
+                        # Format Reply using Template
+                        template_data = {
+                            "mention": message.author.mention,
+                            "filename": attachment.filename,
+                            "identifier": identifier,
+                            "distance": distance,
+                            "original_user_mention": f"<@{original_user_id}>" if original_user_id else "*Unknown*",
+                            "emoji": duplicate_reaction_emoji,
+                            "original_user_info": f", Orig User: <@{original_user_id}>" if original_user_id else "",
+                            "jump_link": ""
+                        }
+                        original_msg_link = None
+                        if original_message_id and message.guild:
+                             try:
+                                  jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
+                                  template_data["jump_link"] = f"\nOriginal: {jump_url}"
+                                  original_msg_link = jump_url
+                             except: pass
+                        reply_text = reply_template.format_map(defaultdict(str, template_data))
+                        await message.reply(reply_text, mention_author=True)
+                    else:
+                        # If replies are disabled, we still need original_msg_link for logging
+                        original_msg_link = None
+                        if original_message_id and message.guild:
+                             try: original_msg_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
+                             except: pass
 
-                    # Use safe formatting (ignore missing keys)
-                    reply_text = reply_template.format_map(defaultdict(str, template_data))
+                    # --- Log Violation ---
+                    log_embed = discord.Embed(
+                        title="Duplicate Image Detected",
+                        color=discord.Color.orange(),
+                        timestamp=datetime.datetime.now(datetime.timezone.utc)
+                    )
+                    log_embed.add_field(name="User", value=f"{message.author.mention} (`{message.author.id}`)", inline=True)
+                    log_embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+                    log_embed.add_field(name="Message", value=f"[Jump Link]({message.jump_url})", inline=True)
+                    log_embed.add_field(name="Image Hash", value=f"`{new_hash}`", inline=False)
+                    log_embed.add_field(name="Match Identifier", value=f"`{identifier}`", inline=True)
+                    log_embed.add_field(name="Hash Distance", value=str(distance), inline=True)
+                    orig_user_mention = f"<@{original_user_id}> (`{original_user_id}`)" if original_user_id else "Unknown"
+                    log_embed.add_field(name="Original User", value=orig_user_mention, inline=True)
+                    if original_msg_link:
+                         log_embed.add_field(name="Original Message", value=f"[Approx. Link]({original_msg_link})", inline=False)
+                    if attachment.url:
+                         log_embed.set_thumbnail(url=attachment.url)
+                    log_embed.set_footer(text=f"Guild ID: {guild_id}")
+                    await log_event(message.guild, log_embed) # Send log
 
-                    await message.reply(reply_text, mention_author=True)
-
+                    # --- Perform Other Actions ---
                     if react_to_duplicates:
                         try: await message.add_reaction(duplicate_reaction_emoji)
                         except Exception as e: print(f"DEBUG: [G:{guild_id}] Failed reaction: {e}")
@@ -438,7 +505,7 @@ async def on_message(message):
 async def check_admin_permissions(interaction: discord.Interaction) -> bool:
     """Checks if the invoking user has administrator permissions."""
     if not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True); return False
+         await interaction.response.send_message("❌ This command must be used in a server.", ephemeral=True); return False
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You need Administrator permissions.", ephemeral=True); return False
     return True
@@ -454,14 +521,18 @@ async def config_view(interaction: discord.Interaction):
     embed = discord.Embed(title=f"Bot Configuration for {interaction.guild.name}", color=discord.Color.blue())
     scope = guild_config.get('duplicate_scope', 'server'); mode = guild_config.get('duplicate_check_mode', 'strict')
     duration = guild_config.get('duplicate_check_duration_days', 0); duration_str = f"{duration} days" if duration > 0 else "Forever"
+    log_channel_id = guild_config.get('log_channel_id'); log_channel_mention = f"<#{log_channel_id}>" if log_channel_id else "Not Set"
+
     embed.add_field(name="Duplicate Scope", value=f"`{scope}`", inline=True); embed.add_field(name="Check Mode", value=f"`{mode}`", inline=True); embed.add_field(name="Check Duration", value=f"`{duration_str}`", inline=True)
+    embed.add_field(name="Log Channel", value=log_channel_mention, inline=False)
+
     for key, value in guild_config.items():
-        if key in ['duplicate_scope', 'duplicate_check_mode', 'duplicate_check_duration_days']: continue
+        if key in ['duplicate_scope', 'duplicate_check_mode', 'duplicate_check_duration_days', 'log_channel_id']: continue
         display_value = value
         if key == 'allowed_channel_ids': display_value = ', '.join(f'<#{ch_id}>' for ch_id in value) if value else "All Channels"
         elif key == 'hash_db_file': display_value = f"`{value}`"
         elif key == 'allowed_users': display_value = ', '.join(f'<@{u_id}>' for u_id in value) if value else "None"
-        elif key == 'duplicate_reply_template': display_value = f"```\n{value}\n```" # Show template in code block
+        elif key == 'duplicate_reply_template': display_value = f"```\n{value}\n```"
         elif isinstance(value, bool): display_value = "Enabled" if value else "Disabled"
         embed.add_field(name=key.replace('_', ' ').title(), value=display_value, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -475,7 +546,8 @@ async def _update_config(interaction: discord.Interaction, setting: str, new_val
     if await save_guild_config(guild_id, guild_config):
         display_new = new_value
         if setting == 'duplicate_check_duration_days': display_new = f"{new_value} days" if new_value > 0 else "Forever"
-        elif setting == 'duplicate_reply_template': display_new = f"```\n{new_value}\n```" # Show template in code block
+        elif setting == 'duplicate_reply_template': display_new = f"```\n{new_value}\n```"
+        elif setting == 'log_channel_id': display_new = f"<#{new_value}>" if new_value else "None"
         await interaction.response.send_message(f"✅ Updated '{setting}' from `{original_value}` to `{display_new}`.", ephemeral=True)
         if setting == 'duplicate_scope': await interaction.followup.send(f"⚠️ **Warning:** Changing scope might affect hash lookup.", ephemeral=True)
     else:
@@ -489,63 +561,82 @@ async def config_set_threshold(interaction: discord.Interaction, value: discord.
 
 @bot.slash_command(name="config_set_hash_size", description="Sets the hash detail level (e.g., 8 or 16).")
 async def config_set_hash_size(interaction: discord.Interaction, value: discord.Option(int, "New hash size (must be >= 4).", min_value=4, max_value=32)):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "hash_size", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "hash_size", value)
 
 @bot.slash_command(name="config_set_react", description="Enable/disable reacting to duplicate messages.")
 async def config_set_react(interaction: discord.Interaction, value: discord.Option(bool, "True to enable, False to disable.")):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "react_to_duplicates", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "react_to_duplicates", value)
 
 @bot.slash_command(name="config_set_delete", description="Enable/disable deleting duplicate messages.")
 async def config_set_delete(interaction: discord.Interaction, value: discord.Option(bool, "True to enable, False to disable.")):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "delete_duplicates", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "delete_duplicates", value)
+
+@bot.slash_command(name="config_set_reply", description="Enable/disable replying to duplicate messages.") # New Command
+async def config_set_reply(interaction: discord.Interaction, value: discord.Option(bool, "True to enable replies, False to disable.")):
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "reply_on_duplicate", value)
 
 @bot.slash_command(name="config_set_emoji", description="Sets the emoji used for duplicate reactions.")
 async def config_set_emoji(interaction: discord.Interaction, value: discord.Option(str, "The new emoji.")):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    # Basic validation: try reacting to check if usable (might fail silently later if invalid custom)
-    try: await interaction.response.defer(ephemeral=True); await interaction.followup.send("Testing emoji...", ephemeral=True); msg = await interaction.original_response(); await msg.add_reaction(value); await msg.remove_reaction(value, bot.user)
-    except Exception: await interaction.edit_original_response(content="❌ Invalid or inaccessible emoji provided."); return
-    await _update_config(interaction, "duplicate_reaction_emoji", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     # Basic validation: try reacting to check if usable (might fail silently later if invalid custom)
+     try: await interaction.response.defer(ephemeral=True); await interaction.followup.send("Testing emoji...", ephemeral=True); msg = await interaction.original_response(); await msg.add_reaction(value); await msg.remove_reaction(value, bot.user)
+     except Exception: await interaction.edit_original_response(content="❌ Invalid or inaccessible emoji provided."); return
+     await _update_config(interaction, "duplicate_reaction_emoji", value)
 
 @bot.slash_command(name="config_set_scope", description="Sets duplicate check scope (server or channel).")
 async def config_set_scope(interaction: discord.Interaction, value: discord.Option(str, "Choose scope.", choices=VALID_SCOPES)):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "duplicate_scope", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "duplicate_scope", value)
 
 @bot.slash_command(name="config_set_check_mode", description="Sets duplicate check mode (strict or owner_allowed).")
 async def config_set_check_mode(interaction: discord.Interaction, value: discord.Option(str, "Choose check mode.", choices=VALID_CHECK_MODES)):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "duplicate_check_mode", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "duplicate_check_mode", value)
 
 @bot.slash_command(name="config_set_duration", description="Sets how many days back to check for duplicates (0=forever).")
 async def config_set_duration(interaction: discord.Interaction, value: discord.Option(int, "Number of days (0 for forever).", min_value=0)):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    await _update_config(interaction, "duplicate_check_duration_days", value)
+     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+     if not await check_admin_permissions(interaction): return
+     await _update_config(interaction, "duplicate_check_duration_days", value)
 
 @bot.slash_command(name="config_set_reply_template", description="Sets the template for duplicate reply messages.")
-async def config_set_reply_template(interaction: discord.Interaction, template: discord.Option(str, "The template string. See README for placeholders.")):
+async def config_set_reply_template(interaction: discord.Interaction, template: discord.Option(str, "The template string. See README/help for placeholders.")):
     """Sets the duplicate reply template."""
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
-    # Basic validation: Ensure it's a non-empty string
-    if not template or not isinstance(template, str):
-        await interaction.response.send_message("❌ Template cannot be empty.", ephemeral=True)
-        return
-    if len(template) > 1500: # Keep template reasonably short
-        await interaction.response.send_message("❌ Template is too long (max 1500 chars).", ephemeral=True)
-        return
+    if not template or not isinstance(template, str): await interaction.response.send_message("❌ Template cannot be empty.", ephemeral=True); return
+    if len(template) > 1500: await interaction.response.send_message("❌ Template is too long (max 1500 chars).", ephemeral=True); return
     await _update_config(interaction, "duplicate_reply_template", template)
     await interaction.followup.send(f"ℹ️ Placeholders: `{{mention}}`, `{{filename}}`, `{{identifier}}`, `{{distance}}`, `{{original_user_mention}}`, `{{emoji}}`, `{{original_user_info}}`, `{{jump_link}}`", ephemeral=True)
+
+@bot.slash_command(name="config_set_log_channel", description="Sets or clears the channel for logging duplicate detections.")
+async def config_set_log_channel(interaction: discord.Interaction, channel: discord.Option(discord.TextChannel, "The channel to send logs to, or omit to disable logging.", required=False, default=None)):
+    """Sets or clears the logging channel."""
+    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
+    if not await check_admin_permissions(interaction): return
+
+    new_channel_id = channel.id if channel else None
+    # Check bot permissions in the target channel if setting one
+    if new_channel_id:
+        log_channel = bot.get_channel(new_channel_id)
+        if not log_channel or not isinstance(log_channel, discord.TextChannel):
+             await interaction.response.send_message("❌ Invalid channel specified.", ephemeral=True); return
+        bot_member = interaction.guild.me
+        if not log_channel.permissions_for(bot_member).send_messages or not log_channel.permissions_for(bot_member).embed_links:
+             await interaction.response.send_message(f"❌ Bot lacks 'Send Messages' or 'Embed Links' permission in {channel.mention}.", ephemeral=True); return
+
+    await _update_config(interaction, "log_channel_id", new_channel_id)
 
 
 # --- Config Channel Commands (Now Top-Level) ---
@@ -669,12 +760,12 @@ async def remove_hash(interaction: discord.Interaction, message_reference: disco
     elif current_scope == "channel":
         for ch_id_str, channel_hashes in stored_hashes.items():
             if isinstance(channel_hashes, dict):
-                for identifier in channel_hashes.keys():
-                    if identifier.startswith(target_message_id_str + "-"): key_to_remove = identifier; channel_key = ch_id_str; break
+                 for identifier in channel_hashes.keys():
+                      if identifier.startswith(target_message_id_str + "-"): key_to_remove = identifier; channel_key = ch_id_str; break
             if key_to_remove: break
         if key_to_remove and channel_key:
-            del stored_hashes[channel_key][key_to_remove]; hash_removed = True
-            if not stored_hashes[channel_key]: del stored_hashes[channel_key]
+             del stored_hashes[channel_key][key_to_remove]; hash_removed = True
+             if not stored_hashes[channel_key]: del stored_hashes[channel_key]
     # Save and respond
     if hash_removed:
         if await save_guild_hashes(guild_id, stored_hashes, loop): await interaction.response.send_message(f"✅ Removed hash for msg `{target_message_id}`.", ephemeral=True)
@@ -683,9 +774,9 @@ async def remove_hash(interaction: discord.Interaction, message_reference: disco
 
 @bot.slash_command(name="hash_clear", description="Clears hashes for the server or a channel. Requires confirmation!")
 async def clear_hashes(
-        interaction: discord.Interaction,
-        confirm: discord.Option(bool, "Must be True to confirm deletion.", required=True),
-        channel: discord.Option(discord.TextChannel, "Optional: Specify a channel to clear hashes only for that channel (if scope is 'channel').", required=False, default=None)
+    interaction: discord.Interaction,
+    confirm: discord.Option(bool, "Must be True to confirm deletion.", required=True),
+    channel: discord.Option(discord.TextChannel, "Optional: Specify a channel to clear hashes only for that channel (if scope is 'channel').", required=False, default=None)
 ):
     """Clears hashes with confirmation."""
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
@@ -713,12 +804,12 @@ async def clear_hashes(
 # --- Scan Command (Remains Top-Level) ---
 @bot.slash_command(name="scan", description="Scans channel history to add/update image hashes.")
 async def scan_history(
-        interaction: discord.Interaction,
-        channel: discord.Option(discord.TextChannel, "The channel to scan."),
-        limit: discord.Option(int, "Max number of messages to scan.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT),
-        flag_duplicates: discord.Option(bool, "Add reaction to non-oldest duplicates found?", default=False),
-        reply_to_duplicates: discord.Option(bool, "Reply to non-oldest duplicates found?", default=False),
-        delete_duplicates: discord.Option(bool, "Delete non-oldest duplicates found? (Requires Manage Messages)", default=False)
+    interaction: discord.Interaction,
+    channel: discord.Option(discord.TextChannel, "The channel to scan."),
+    limit: discord.Option(int, "Max number of messages to scan.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT),
+    flag_duplicates: discord.Option(bool, "Add reaction to non-oldest duplicates found?", default=False),
+    reply_to_duplicates: discord.Option(bool, "Reply to non-oldest duplicates found?", default=False),
+    delete_duplicates: discord.Option(bool, "Delete non-oldest duplicates found? (Requires Manage Messages)", default=False)
 ):
     """Scans past messages, populates DB (finds oldest), optionally flags/replies/deletes non-oldest duplicates."""
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
@@ -730,12 +821,12 @@ async def scan_history(
     current_mode = guild_config.get('duplicate_check_mode', 'strict')
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
     current_duration = guild_config.get('duplicate_check_duration_days', 0)
-    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE) # Get template for replies
+    reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE)
 
     # Check permissions
     bot_member = interaction.guild.me
     if not channel.permissions_for(bot_member).read_message_history:
-        await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
+         await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
     perms_needed = []
     if flag_duplicates and not channel.permissions_for(bot_member).add_reactions: perms_needed.append("Add Reactions")
     if reply_to_duplicates and not channel.permissions_for(bot_member).send_messages: perms_needed.append("Send Messages")
@@ -779,8 +870,8 @@ async def scan_history(
     for img_hash_str, entries in scanned_image_data.items():
         processed_hashes += 1
         if processed_hashes % SCAN_UPDATE_INTERVAL == 0:
-            try: await status_message.edit(content=f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes} Updated:{updated_hashes} Replied:{replied_count} Flagged:{flagged_count} Deleted:{deleted_count}")
-            except Exception as e: print(f"DEBUG: Error editing status: {e}")
+             try: await status_message.edit(content=f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes} Updated:{updated_hashes} Replied:{replied_count} Flagged:{flagged_count} Deleted:{deleted_count}")
+             except Exception as e: print(f"DEBUG: Error editing status: {e}")
         if not entries: continue
         entries.sort(key=lambda x: x[0]); oldest_entry = entries[0]
         oldest_timestamp, oldest_msg_id, oldest_user_id, oldest_filename, oldest_message_obj = oldest_entry
@@ -821,30 +912,26 @@ async def scan_history(
             elif current_mode == "owner_allowed":
                 if oldest_user_id is None or oldest_user_id != entry_user_id: is_violation = True
             if is_violation and current_duration > 0:
-                if (entry_timestamp - oldest_timestamp).days > current_duration: is_violation = False
+                 if (entry_timestamp - oldest_timestamp).days > current_duration: is_violation = False
             if is_violation:
                 action_taken = False
                 # Reply
                 if reply_to_duplicates:
                     try:
-                        # Format reply using template
                         template_data = {
-                            "mention": f"<@{entry_user_id}>", # Mention the user of *this* message
+                            "mention": f"<@{entry_user_id}>",
                             "filename": entry_filename,
-                            "identifier": oldest_identifier, # Reference the oldest
-                            "distance": "?", # Distance isn't easily available here, maybe omit or calculate if needed
+                            "identifier": oldest_identifier,
+                            "distance": "?", # Not calculated here
                             "original_user_mention": f"<@{oldest_user_id}>" if oldest_user_id else "*Unknown*",
                             "emoji": duplicate_reaction_emoji,
                             "original_user_info": f", Orig User: <@{oldest_user_id}>" if oldest_user_id else "",
                             "jump_link": ""
                         }
                         if oldest_message_obj:
-                            try:
-                                jump_url = oldest_message_obj.jump_url
-                                template_data["jump_link"] = f"\nOriginal: {jump_url}"
-                            except: pass
+                             try: template_data["jump_link"] = f"\nOriginal: {oldest_message_obj.jump_url}"
+                             except: pass
                         reply_text = reply_template.format_map(defaultdict(str, template_data))
-
                         await entry_message_obj.reply(reply_text, mention_author=False)
                         replied_count += 1; action_taken = True
                     except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages perm.")
@@ -855,7 +942,7 @@ async def scan_history(
                     try:
                         already_reacted = False; refreshed_message = await channel.fetch_message(entry_message_obj.id)
                         for reaction in refreshed_message.reactions:
-                            if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me: already_reacted = True; break
+                             if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me: already_reacted = True; break
                         if not already_reacted: await entry_message_obj.add_reaction(duplicate_reaction_emoji); flagged_count += 1; action_taken = True
                     except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Add Reactions perm."); break
                     except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reaction.")
@@ -872,18 +959,18 @@ async def scan_history(
     if db_updated:
         print(f"DEBUG: [Scan G:{guild_id}] Saving updated hash database after scan...")
         if not await save_guild_hashes(guild_id, stored_hashes, loop):
-            try: await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
-            except: pass
+             try: await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
+             except: pass
     await status_message.edit(content=f"✅ Scan Complete! Processed {processed_messages}. Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, Flagged:{flagged_count}, Deleted:{deleted_count}. Skipped:{skipped_attachments}. Errors:{errors}.")
 
 
 # --- New Clear Flags Command ---
 @bot.slash_command(name="clearflags", description="Removes the bot's duplicate warning reactions from messages in a channel.")
 async def clear_flags(
-        interaction: discord.Interaction,
-        channel: discord.Option(discord.TextChannel, "The channel to clear reactions from."),
-        confirm: discord.Option(bool, "Must be True to confirm clearing reactions.", required=True), # Required comes first
-        limit: discord.Option(int, "Max number of messages to check.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT) # Optional comes last
+    interaction: discord.Interaction,
+    channel: discord.Option(discord.TextChannel, "The channel to clear reactions from."),
+    confirm: discord.Option(bool, "Must be True to confirm clearing reactions.", required=True),
+    limit: discord.Option(int, "Max number of messages to check.", min_value=1, max_value=10000, default=DEFAULT_SCAN_LIMIT)
 ):
     """Removes the bot's configured duplicate reaction from messages in channel history."""
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
@@ -893,51 +980,36 @@ async def clear_flags(
     guild_id = interaction.guild_id
     guild_config = get_guild_config(guild_id)
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
-    bot_member = interaction.guild.me # Get the bot's Member object in this guild
+    bot_member = interaction.guild.me
 
     # Check permissions
     if not channel.permissions_for(bot_member).read_message_history:
-        await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
+         await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
     if not channel.permissions_for(bot_member).add_reactions: # Need Add Reactions to remove own reactions
-        print(f"Warning: [ClearFlags G:{guild_id}] Bot might lack Add Reactions permission needed to remove reactions in {channel.mention}.")
-        # Proceed anyway, try/except will handle actual failures
+         print(f"Warning: [ClearFlags G:{guild_id}] Bot might lack Add Reactions permission needed in {channel.mention}.")
 
-    await interaction.response.defer(ephemeral=False) # Public deferral
+    await interaction.response.defer(ephemeral=False)
     status_message = await interaction.followup.send(f"⏳ Starting reaction cleanup in {channel.mention} (limit {limit})...", wait=True)
 
-    processed_msgs = 0
-    reactions_removed = 0
-    errors = 0
-
+    processed_msgs = 0; reactions_removed = 0; errors = 0
     try:
         async for message in channel.history(limit=limit):
             processed_msgs += 1
             if processed_msgs % SCAN_UPDATE_INTERVAL == 0:
                 try: await status_message.edit(content=f"⏳ Clearing flags... Checked {processed_msgs}/{limit}. Removed {reactions_removed}.")
                 except Exception as e: print(f"DEBUG: Error editing status: {e}")
-
-            # Check reactions on the message
             for reaction in message.reactions:
-                # Is it the configured emoji AND was it added by the bot itself?
                 if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me:
                     try:
-                        # Use bot_member variable here
                         await message.remove_reaction(duplicate_reaction_emoji, bot_member)
                         reactions_removed += 1
-                        await asyncio.sleep(CLEAR_REACTION_DELAY) # Delay between removals
-                    except discord.Forbidden:
-                        print(f"Warning: [ClearFlags G:{guild_id}] Missing permission to remove reaction in {channel.mention}.")
-                        # Stop trying if permission denied once? Or keep trying per message? Keep trying for now.
-                    except discord.NotFound:
-                        print(f"Warning: [ClearFlags G:{guild_id}] Message {message.id} or reaction not found.")
-                    except Exception as e:
-                        print(f"Error: [ClearFlags G:{guild_id}] Failed to remove reaction from {message.id}: {e}")
-                        errors += 1
-                    break # Move to next message once bot's reaction is found/handled
-
+                        await asyncio.sleep(CLEAR_REACTION_DELAY)
+                    except discord.Forbidden: print(f"Warning: [ClearFlags G:{guild_id}] Missing permission to remove reaction in {channel.mention}.")
+                    except discord.NotFound: print(f"Warning: [ClearFlags G:{guild_id}] Message {message.id} or reaction not found.")
+                    except Exception as e: print(f"Error: [ClearFlags G:{guild_id}] Failed to remove reaction from {message.id}: {e}"); errors += 1
+                    break
     except discord.Forbidden: await status_message.edit(content=f"❌ Cleanup failed. Bot lacks permissions in {channel.mention}."); return
     except Exception as e: await status_message.edit(content=f"❌ Error during cleanup: {e}"); traceback.print_exc(); return
-
     await status_message.edit(content=f"✅ Cleanup Complete! Checked {processed_msgs} messages in {channel.mention}. Removed **{reactions_removed}** reactions. Errors: {errors}.")
 
 
