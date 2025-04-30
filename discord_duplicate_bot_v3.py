@@ -84,10 +84,10 @@ def get_default_guild_config(guild_id):
     }
 
 def validate_config_data(config_data):
-     """Validates config, including new fields."""
-     validated = get_default_guild_config(0).copy()
-     validated.update(config_data)
-     try:
+    """Validates config, including new fields."""
+    validated = get_default_guild_config(0).copy()
+    validated.update(config_data)
+    try:
         # Coerce types
         validated['hash_size'] = int(validated['hash_size'])
         validated['similarity_threshold'] = int(validated['similarity_threshold'])
@@ -104,8 +104,8 @@ def validate_config_data(config_data):
         # Validate allowed_channel_ids (list of ints or None)
         if validated['allowed_channel_ids'] is not None:
             if isinstance(validated['allowed_channel_ids'], list):
-                 validated['allowed_channel_ids'] = [int(ch_id) for ch_id in validated['allowed_channel_ids'] if str(ch_id).isdigit()]
-                 if not validated['allowed_channel_ids']: validated['allowed_channel_ids'] = None
+                validated['allowed_channel_ids'] = [int(ch_id) for ch_id in validated['allowed_channel_ids'] if str(ch_id).isdigit()]
+                if not validated['allowed_channel_ids']: validated['allowed_channel_ids'] = None
             else: validated['allowed_channel_ids'] = None
 
         # Validate allowed_users (list of ints or empty list)
@@ -124,9 +124,9 @@ def validate_config_data(config_data):
             try: validated['log_channel_id'] = int(log_id)
             except (ValueError, TypeError): validated['log_channel_id'] = None
 
-     except (ValueError, TypeError, KeyError) as e:
-          print(f"Warning: Error validating config types/keys: {e}. Some defaults may be used.", file=sys.stderr)
-     return validated
+    except (ValueError, TypeError, KeyError) as e:
+        print(f"Warning: Error validating config types/keys: {e}. Some defaults may be used.", file=sys.stderr)
+    return validated
 
 async def load_main_config():
     """Loads the main server_configs.json file."""
@@ -183,11 +183,11 @@ def get_guild_config(guild_id):
     return server_configs[guild_id]
 
 async def save_guild_config(guild_id, guild_config_data):
-     """Updates guild config and saves main file."""
-     global server_configs
-     server_configs[guild_id] = validate_config_data(guild_config_data)
-     server_configs[guild_id]['hash_db_file'] = f"{HASH_FILENAME_PREFIX}{guild_id}.json"
-     return await save_main_config()
+    """Updates guild config and saves main file."""
+    global server_configs
+    server_configs[guild_id] = validate_config_data(guild_config_data)
+    server_configs[guild_id]['hash_db_file'] = f"{HASH_FILENAME_PREFIX}{guild_id}.json"
+    return await save_main_config()
 
 
 # --- Hashing and File I/O Functions (Remain the same) ---
@@ -327,9 +327,9 @@ async def log_event(guild: discord.Guild, embed: discord.Embed):
             if isinstance(log_channel, discord.TextChannel):
                  # Check permissions before sending
                  if log_channel.permissions_for(guild.me).send_messages and log_channel.permissions_for(guild.me).embed_links:
-                      await log_channel.send(embed=embed)
+                     await log_channel.send(embed=embed)
                  else:
-                      print(f"Warning: [G:{guild.id}] Missing Send Messages/Embed Links permission in log channel {log_channel_id}.")
+                     print(f"Warning: [G:{guild.id}] Missing Send Messages/Embed Links permission in log channel {log_channel_id}.")
             else:
                  print(f"Warning: [G:{guild.id}] Configured log channel {log_channel_id} is not a text channel.")
         except discord.NotFound:
@@ -431,19 +431,22 @@ async def on_message(message):
                         }
                         original_msg_link = None
                         if original_message_id and message.guild:
-                             try:
-                                  jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
-                                  template_data["jump_link"] = f"\nOriginal: {jump_url}"
-                                  original_msg_link = jump_url
-                             except: pass
+                            try:
+                                # Try to get original message channel ID if possible (might not be current channel)
+                                # This part is tricky without fetching the original message, which is slow/expensive.
+                                # We will assume for now it's the same channel for the jump link.
+                                jump_url = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
+                                template_data["jump_link"] = f"\nOriginal: {jump_url}"
+                                original_msg_link = jump_url
+                            except: pass
                         reply_text = reply_template.format_map(defaultdict(str, template_data))
                         await message.reply(reply_text, mention_author=True)
                     else:
-                        # If replies are disabled, we still need original_msg_link for logging
+                        # If replies are disabled, we still need original_msg_link for logging (best effort)
                         original_msg_link = None
                         if original_message_id and message.guild:
-                             try: original_msg_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
-                             except: pass
+                            try: original_msg_link = f"https://discord.com/channels/{message.guild.id}/{message.channel.id}/{original_message_id}"
+                            except: pass
 
                     # --- Log Violation ---
                     log_embed = discord.Embed(
@@ -479,6 +482,7 @@ async def on_message(message):
                 # --- Add Unique Hash (if no violation) ---
                 elif not is_violation:
                     # Check if this exact hash already exists before adding
+                    # Use existence_threshold = 0 for exact match check
                     existing_identifier, _ = find_existing_hash_entry_sync(new_hash, stored_hashes, 0, current_scope, channel_id_str)
                     if not existing_identifier: # Only add if truly new
                         unique_identifier = f"{message.id}-{attachment.filename}"
@@ -534,7 +538,7 @@ async def config_view(interaction: discord.Interaction):
         elif key == 'allowed_users': display_value = ', '.join(f'<@{u_id}>' for u_id in value) if value else "None"
         elif key == 'duplicate_reply_template': display_value = f"```\n{value}\n```"
         elif isinstance(value, bool): display_value = "Enabled" if value else "Disabled"
-        embed.add_field(name=key.replace('_', ' ').title(), value=display_value, inline=False)
+        embed.add_field(name=key.replace('_', ' ').title(), value=str(display_value), inline=False) # Ensure display_value is str
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def _update_config(interaction: discord.Interaction, setting: str, new_value: typing.Any):
@@ -588,9 +592,22 @@ async def config_set_emoji(interaction: discord.Interaction, value: discord.Opti
      if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
      if not await check_admin_permissions(interaction): return
      # Basic validation: try reacting to check if usable (might fail silently later if invalid custom)
-     try: await interaction.response.defer(ephemeral=True); await interaction.followup.send("Testing emoji...", ephemeral=True); msg = await interaction.original_response(); await msg.add_reaction(value); await msg.remove_reaction(value, bot.user)
-     except Exception: await interaction.edit_original_response(content="❌ Invalid or inaccessible emoji provided."); return
+     try:
+         await interaction.response.defer(ephemeral=True) # Defer first
+         test_msg = await interaction.followup.send("Testing emoji...", ephemeral=True) # Send test message
+         await test_msg.add_reaction(value) # Try reacting
+         await test_msg.remove_reaction(value, bot.user) # Clean up reaction
+         # Don't edit original response here, proceed to update config
+     except discord.HTTPException as e: # Catch specific HTTP exceptions (like invalid emoji)
+         await interaction.edit_original_response(content=f"❌ Invalid or inaccessible emoji provided. Error: {e.text}")
+         return
+     except Exception as e: # Catch other potential errors
+         await interaction.edit_original_response(content=f"❌ An error occurred while testing the emoji: {e}")
+         return
+
+     # If reaction test passed, update the config
      await _update_config(interaction, "duplicate_reaction_emoji", value)
+     # _update_config now handles the final response message after successful update.
 
 @bot.slash_command(name="config_set_scope", description="Sets duplicate check scope (server or channel).")
 async def config_set_scope(interaction: discord.Interaction, value: discord.Option(str, "Choose scope.", choices=VALID_SCOPES)):
@@ -629,12 +646,17 @@ async def config_set_log_channel(interaction: discord.Interaction, channel: disc
     new_channel_id = channel.id if channel else None
     # Check bot permissions in the target channel if setting one
     if new_channel_id:
-        log_channel = bot.get_channel(new_channel_id)
+        # We need interaction.guild here, not bot.get_guild
+        if not interaction.guild:
+             await interaction.response.send_message("❌ Cannot determine guild.", ephemeral=True); return
+
+        log_channel = interaction.guild.get_channel(new_channel_id) # Use guild context
         if not log_channel or not isinstance(log_channel, discord.TextChannel):
-             await interaction.response.send_message("❌ Invalid channel specified.", ephemeral=True); return
+              await interaction.response.send_message("❌ Invalid channel specified or not found in this server.", ephemeral=True); return
+
         bot_member = interaction.guild.me
         if not log_channel.permissions_for(bot_member).send_messages or not log_channel.permissions_for(bot_member).embed_links:
-             await interaction.response.send_message(f"❌ Bot lacks 'Send Messages' or 'Embed Links' permission in {channel.mention}.", ephemeral=True); return
+              await interaction.response.send_message(f"❌ Bot lacks 'Send Messages' or 'Embed Links' permission in {channel.mention}.", ephemeral=True); return
 
     await _update_config(interaction, "log_channel_id", new_channel_id)
 
@@ -699,9 +721,15 @@ async def allowlist_view(interaction: discord.Interaction):
     if user_list:
         embed = discord.Embed(title=f"Allowlisted Users for {interaction.guild.name}", color=discord.Color.green()); mentions = []
         for user_id in user_list:
-            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-            if user: mentions.append(f"- {user.mention} (`{user_id}`)")
-            else: mentions.append(f"- *Unknown User* (`{user_id}`)")
+            try:
+                user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+                if user: mentions.append(f"- {user.mention} (`{user_id}`)")
+                else: mentions.append(f"- *Unknown User* (`{user_id}`)")
+            except discord.NotFound:
+                 mentions.append(f"- *Unknown User (ID not found)* (`{user_id}`)")
+            except Exception as e:
+                 mentions.append(f"- *Error fetching user* (`{user_id}`): {e}")
+                 print(f"Error fetching user {user_id} for allowlist view: {e}")
         embed.description = '\n'.join(mentions); await interaction.response.send_message(embed=embed, ephemeral=True)
     else: await interaction.response.send_message("ℹ️ No users allowlisted.", ephemeral=True)
 
@@ -761,15 +789,15 @@ async def remove_hash(interaction: discord.Interaction, message_reference: disco
         for ch_id_str, channel_hashes in stored_hashes.items():
             if isinstance(channel_hashes, dict):
                  for identifier in channel_hashes.keys():
-                      if identifier.startswith(target_message_id_str + "-"): key_to_remove = identifier; channel_key = ch_id_str; break
+                     if identifier.startswith(target_message_id_str + "-"): key_to_remove = identifier; channel_key = ch_id_str; break
             if key_to_remove: break
         if key_to_remove and channel_key:
-             del stored_hashes[channel_key][key_to_remove]; hash_removed = True
-             if not stored_hashes[channel_key]: del stored_hashes[channel_key]
+            del stored_hashes[channel_key][key_to_remove]; hash_removed = True
+            if not stored_hashes[channel_key]: del stored_hashes[channel_key]
     # Save and respond
     if hash_removed:
-        if await save_guild_hashes(guild_id, stored_hashes, loop): await interaction.response.send_message(f"✅ Removed hash for msg `{target_message_id}`.", ephemeral=True)
-        else: await interaction.response.send_message("⚠️ Error saving DB.", ephemeral=True)
+        if await save_guild_hashes(guild_id, stored_hashes, loop): await interaction.response.send_message(f"✅ Removed hash for msg `{target_message_id}` (key: `{key_to_remove}`).", ephemeral=True)
+        else: await interaction.response.send_message("⚠️ Error saving DB after hash removal.", ephemeral=True)
     else: await interaction.response.send_message(f"ℹ️ No hash found for msg `{target_message_id}`.", ephemeral=True)
 
 @bot.slash_command(name="hash_clear", description="Clears hashes for the server or a channel. Requires confirmation!")
@@ -793,7 +821,7 @@ async def clear_hashes(
         if current_scope == "channel":
             if target_channel_id_str in stored_hashes: del stored_hashes[target_channel_id_str]; cleared = True
             else: await interaction.followup.send(f"ℹ️ No hashes found for {channel.mention} (Scope is 'channel').", ephemeral=True); return
-        elif current_scope == "server": await interaction.followup.send(f"ℹ️ Cannot clear specific channel when scope is 'server'. Use `/hash_clear confirm:True`.", ephemeral=True); return
+        elif current_scope == "server": await interaction.followup.send(f"ℹ️ Cannot clear specific channel when scope is 'server'. Use `/hash_clear confirm:True` without specifying a channel.", ephemeral=True); return
     else: # Clear all for guild
         stored_hashes.clear(); cleared = True
     if cleared:
@@ -822,19 +850,22 @@ async def scan_history(
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
     current_duration = guild_config.get('duplicate_check_duration_days', 0)
     reply_template = guild_config.get('duplicate_reply_template', DEFAULT_REPLY_TEMPLATE)
+    reply_on_scan_duplicate = guild_config.get('reply_on_duplicate', True) # Check if global replies are enabled
 
     # Check permissions
+    if not interaction.guild: await interaction.response.send_message("❌ Cannot determine guild.", ephemeral=True); return
     bot_member = interaction.guild.me
     if not channel.permissions_for(bot_member).read_message_history:
          await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
     perms_needed = []
     if flag_duplicates and not channel.permissions_for(bot_member).add_reactions: perms_needed.append("Add Reactions")
-    if reply_to_duplicates and not channel.permissions_for(bot_member).send_messages: perms_needed.append("Send Messages")
+    # Check send messages perm only if BOTH global reply setting AND scan reply setting are true
+    if reply_on_scan_duplicate and reply_to_duplicates and not channel.permissions_for(bot_member).send_messages: perms_needed.append("Send Messages")
     if delete_duplicates and not channel.permissions_for(bot_member).manage_messages: perms_needed.append("Manage Messages")
     if perms_needed:
         await interaction.response.send_message(f"❌ Bot lacks permissions ({', '.join(perms_needed)}) in {channel.mention} for requested actions.", ephemeral=True); return
 
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=False) # Defer publicly
     status_message = await interaction.followup.send(f"⏳ Starting scan: {channel.mention}, limit={limit}, Flagging:{flag_duplicates}, Replying:{reply_to_duplicates}, Deleting:{delete_duplicates}...", wait=True)
 
     processed_messages = 0; added_hashes = 0; updated_hashes = 0; flagged_count = 0; replied_count = 0; deleted_count = 0
@@ -849,7 +880,7 @@ async def scan_history(
             processed_messages += 1
             if processed_messages % SCAN_UPDATE_INTERVAL == 0:
                 try: await status_message.edit(content=f"⏳ Scanning... Processed {processed_messages}/{limit} (Phase 1).")
-                except Exception as e: print(f"DEBUG: Error editing status: {e}")
+                except Exception as e: print(f"DEBUG: Error editing status (Phase 1): {e}") # Log error but continue
             if message.author.bot or not message.attachments: continue
             message_user_id = message.author.id; message_timestamp = message.created_at.replace(tzinfo=datetime.timezone.utc)
             for attachment in message.attachments:
@@ -857,27 +888,44 @@ async def scan_history(
                     try:
                         image_bytes = await attachment.read(); img_hash = await calculate_hash(image_bytes, current_hash_size, loop)
                         if img_hash is None: skipped_attachments += 1; continue
+                        # Store message object directly for later use in actions
                         scanned_image_data[str(img_hash)].append((message_timestamp, message.id, message_user_id, attachment.filename, message))
-                    except discord.HTTPException as e: print(f"Warning: [Scan G:{guild_id}] Failed download {attachment.id}: {e}"); errors += 1; skipped_attachments += 1
-                    except Exception as e: print(f"Error: [Scan G:{guild_id}] Error processing attach {attachment.id}: {e}"); errors += 1; skipped_attachments += 1; traceback.print_exc()
-    except discord.Forbidden: await status_message.edit(content=f"❌ Scan failed (Phase 1). Bot lacks permissions in {channel.mention}."); return
-    except Exception as e: await status_message.edit(content=f"❌ Error during scan (Phase 1): {e}"); traceback.print_exc(); return
+                    except discord.HTTPException as e: print(f"Warning: [Scan G:{guild_id}] Failed download attach {attachment.id} from msg {message.id}: {e}"); errors += 1; skipped_attachments += 1
+                    except UnidentifiedImageError: print(f"Warning: [Scan G:{guild_id}] Skipping unidentifiable image attach {attachment.id} from msg {message.id}"); errors += 1; skipped_attachments += 1
+                    except Exception as e: print(f"Error: [Scan G:{guild_id}] Error processing attach {attachment.id} from msg {message.id}: {e}"); errors += 1; skipped_attachments += 1; traceback.print_exc()
+    except discord.Forbidden:
+         # Can't edit message if permission denied during history fetch
+         final_content = f"❌ Scan failed (Phase 1). Bot lacks Read Message History permission in {channel.mention}."
+         try: await status_message.edit(content=final_content)
+         except discord.HTTPException: await interaction.channel.send(content=final_content) # Fallback if edit fails
+         return
+    except Exception as e:
+         final_content = f"❌ Error during scan (Phase 1): {e}"
+         try: await status_message.edit(content=final_content)
+         except discord.HTTPException: await interaction.channel.send(content=final_content) # Fallback if edit fails
+         traceback.print_exc(); return
     print(f"DEBUG: [Scan G:{guild_id}] Phase 1 complete. Found {len(scanned_image_data)} unique hash groups.")
 
     # --- Phase 2: Process hashes ---
-    await status_message.edit(content=f"⏳ Processing {len(scanned_image_data)} unique hash groups...")
+    try: await status_message.edit(content=f"⏳ Processing {len(scanned_image_data)} unique hash groups...")
+    except Exception as e: print(f"DEBUG: Error editing status (Phase 2 Start): {e}")
+
     stored_hashes = await load_guild_hashes(guild_id, loop); db_updated = False; processed_hashes = 0
     for img_hash_str, entries in scanned_image_data.items():
         processed_hashes += 1
         if processed_hashes % SCAN_UPDATE_INTERVAL == 0:
-             try: await status_message.edit(content=f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes} Updated:{updated_hashes} Replied:{replied_count} Flagged:{flagged_count} Deleted:{deleted_count}")
-             except Exception as e: print(f"DEBUG: Error editing status: {e}")
+            try: await status_message.edit(content=f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes} Updated:{updated_hashes} Replied:{replied_count} Flagged:{flagged_count} Deleted:{deleted_count}")
+            except Exception as e: print(f"DEBUG: Error editing status (Phase 2 Loop): {e}") # Log error but continue processing
+
         if not entries: continue
         entries.sort(key=lambda x: x[0]); oldest_entry = entries[0]
         oldest_timestamp, oldest_msg_id, oldest_user_id, oldest_filename, oldest_message_obj = oldest_entry
         oldest_identifier = f"{oldest_msg_id}-{oldest_filename}"
         oldest_hash_data = {"hash": img_hash_str, "user_id": oldest_user_id, "timestamp": oldest_timestamp.isoformat()}
-        img_hash_obj = imagehash.hex_to_hash(img_hash_str)
+
+        try: img_hash_obj = imagehash.hex_to_hash(img_hash_str)
+        except ValueError: print(f"Warning: [Scan G:{guild_id}] Invalid hash string '{img_hash_str}', skipping group."); errors += len(entries); continue # Skip this hash group
+
         existing_identifier, existing_data = find_existing_hash_entry_sync(img_hash_obj, stored_hashes, existence_threshold, current_scope, scan_channel_id_str)
         update_needed = False; identifier_to_use = oldest_identifier; data_to_use = oldest_hash_data
         if existing_identifier:
@@ -887,81 +935,165 @@ async def scan_history(
                 try:
                     existing_time = dateutil.parser.isoparse(existing_timestamp_str)
                     if existing_time.tzinfo is None: existing_time = existing_time.replace(tzinfo=datetime.timezone.utc)
-                    if oldest_timestamp < existing_time: update_needed = True; updated_hashes += 1
-                    else: identifier_to_use = existing_identifier; data_to_use = existing_data if isinstance(existing_data, dict) else {"hash": existing_data, "user_id": None, "timestamp": None}
-                except Exception: pass
-        else: update_needed = True; added_hashes += 1
+                    if oldest_timestamp < existing_time: update_needed = True; # Keep track but don't increment updated_hashes yet
+                    else: identifier_to_use = existing_identifier; data_to_use = existing_data if isinstance(existing_data, dict) else {"hash": existing_data, "user_id": None, "timestamp": None} # Use existing if older or same age
+                except Exception as parse_e: print(f"Warning: [Scan G:{guild_id}] Error parsing existing timestamp '{existing_timestamp_str}': {parse_e}. Assuming update needed."); update_needed = True # Default to update if timestamp is bad
+            else: # No timestamp on existing data, assume update needed to add timestamp
+                 update_needed = True
+        else: update_needed = True # No existing entry, definitely add
+
         # DB Update/Add
         if update_needed:
             db_updated = True
+            # Only increment counts if it's truly new or replacing an older entry
+            if existing_identifier and oldest_timestamp < existing_time: updated_hashes +=1
+            elif not existing_identifier: added_hashes += 1
+
             if current_scope == "server":
                 if not isinstance(stored_hashes, dict): stored_hashes = {}
+                # Remove old entry only if the identifier changed (i.e., we found an older message)
                 if existing_identifier and existing_identifier != identifier_to_use: stored_hashes.pop(existing_identifier, None)
                 stored_hashes[identifier_to_use] = data_to_use
             elif current_scope == "channel":
                 if not isinstance(stored_hashes, dict): stored_hashes = {}
                 channel_hashes = stored_hashes.setdefault(scan_channel_id_str, {})
                 if not isinstance(channel_hashes, dict): channel_hashes = {}; stored_hashes[scan_channel_id_str] = channel_hashes
+                # Remove old entry only if the identifier changed
                 if existing_identifier and existing_identifier != identifier_to_use: channel_hashes.pop(existing_identifier, None)
                 channel_hashes[identifier_to_use] = data_to_use
-        # Flagging/Replying/Deleting Logic
+
+        # --- Flagging/Replying/Deleting Logic for Non-Oldest Entries ---
         for entry_timestamp, entry_msg_id, entry_user_id, entry_filename, entry_message_obj in entries:
+            # Skip the entry identified as the oldest for this hash group
             if entry_msg_id == oldest_msg_id: continue
+
             is_violation = False
+            # Determine if the current entry is a violation based on mode and user IDs
             if current_mode == "strict": is_violation = True
             elif current_mode == "owner_allowed":
                 if oldest_user_id is None or oldest_user_id != entry_user_id: is_violation = True
+
+            # Check duration if applicable
             if is_violation and current_duration > 0:
                  if (entry_timestamp - oldest_timestamp).days > current_duration: is_violation = False
+
             if is_violation:
                 action_taken = False
-                # Reply
-                if reply_to_duplicates:
+                # Reply (only if global reply is on AND scan reply option is on)
+                if reply_on_scan_duplicate and reply_to_duplicates:
                     try:
                         template_data = {
                             "mention": f"<@{entry_user_id}>",
                             "filename": entry_filename,
-                            "identifier": oldest_identifier,
-                            "distance": "?", # Not calculated here
+                            "identifier": identifier_to_use, # Use the identifier of the actual oldest
+                            "distance": 0, # Distance is 0 for exact hash match in scan
                             "original_user_mention": f"<@{oldest_user_id}>" if oldest_user_id else "*Unknown*",
                             "emoji": duplicate_reaction_emoji,
                             "original_user_info": f", Orig User: <@{oldest_user_id}>" if oldest_user_id else "",
                             "jump_link": ""
                         }
                         if oldest_message_obj:
-                             try: template_data["jump_link"] = f"\nOriginal: {oldest_message_obj.jump_url}"
-                             except: pass
+                            try: template_data["jump_link"] = f"\nOriginal: {oldest_message_obj.jump_url}"
+                            except: pass # Ignore if jump_url fails for some reason
                         reply_text = reply_template.format_map(defaultdict(str, template_data))
-                        await entry_message_obj.reply(reply_text, mention_author=False)
+                        await entry_message_obj.reply(reply_text, mention_author=False) # Don't ping user during scan replies
                         replied_count += 1; action_taken = True
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages perm.")
-                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reply.")
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Send Messages perm for reply to {entry_msg_id}."); break # Stop trying actions for this msg
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reply.") # Continue to other actions
                     except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed reply to {entry_msg_id}: {e}")
+
                 # React
                 if flag_duplicates:
                     try:
-                        already_reacted = False; refreshed_message = await channel.fetch_message(entry_message_obj.id)
+                        # Check if already reacted by fetching fresh message state
+                        refreshed_message = await channel.fetch_message(entry_message_obj.id)
+                        already_reacted = False;
                         for reaction in refreshed_message.reactions:
-                             if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me: already_reacted = True; break
-                        if not already_reacted: await entry_message_obj.add_reaction(duplicate_reaction_emoji); flagged_count += 1; action_taken = True
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Add Reactions perm."); break
-                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reaction.")
-                    except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed reaction: {e}")
+                            if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me:
+                                already_reacted = True; break
+                        if not already_reacted:
+                             await entry_message_obj.add_reaction(duplicate_reaction_emoji)
+                             flagged_count += 1; action_taken = True
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Add Reactions perm for reaction on {entry_msg_id}."); break # Stop trying actions for this msg
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for reaction.") # Continue to other actions
+                    except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed reaction on {entry_msg_id}: {e}")
+
                 # Delete
                 if delete_duplicates:
-                    try: await entry_message_obj.delete(); deleted_count += 1; action_taken = True; print(f"DEBUG: [Scan Action G:{guild_id}] Deleted msg {entry_msg_id}")
-                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Manage Messages perm.")
-                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for deletion.")
+                    try:
+                        await entry_message_obj.delete()
+                        deleted_count += 1; action_taken = True
+                        print(f"DEBUG: [Scan Action G:{guild_id}] Deleted msg {entry_msg_id}")
+                    except discord.Forbidden: print(f"Warning: [Scan Action G:{guild_id}] Missing Manage Messages perm for delete on {entry_msg_id}."); break # Stop trying actions for this msg
+                    except discord.NotFound: print(f"Warning: [Scan Action G:{guild_id}] Msg {entry_msg_id} not found for deletion.") # Message already gone?
                     except Exception as e: print(f"DEBUG: [Scan Action G:{guild_id}] Failed delete msg {entry_msg_id}: {e}")
-                # Delay
+
+                # Delay if any action was attempted/succeeded to avoid rate limits
                 if action_taken: await asyncio.sleep(SCAN_ACTION_DELAY)
-    # Final Save and Report
+
+    # --- Final Save and Report ---
     if db_updated:
         print(f"DEBUG: [Scan G:{guild_id}] Saving updated hash database after scan...")
         if not await save_guild_hashes(guild_id, stored_hashes, loop):
-             try: await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
-             except: pass
-    await status_message.edit(content=f"✅ Scan Complete! Processed {processed_messages}. Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, Flagged:{flagged_count}, Deleted:{deleted_count}. Skipped:{skipped_attachments}. Errors:{errors}.")
+            # Try to notify about save error via interaction channel if possible
+            try:
+                 await interaction.followup.send("⚠️ Error saving hashes after scan.", ephemeral=True)
+            except discord.HTTPException: # Token might be expired here too
+                 print(f"ERROR: [Scan G:{guild_id}] Failed to save hashes AND failed to send followup.")
+                 # Optionally send to log channel if configured and possible
+                 # await log_event(...)
+
+
+    # --- <<<< MODIFIED FINAL STATUS UPDATE >>>> ---
+    final_message_content = f"✅ Scan Complete! Processed {processed_messages}. Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, Flagged:{flagged_count}, Deleted:{deleted_count}. Skipped:{skipped_attachments}. Errors:{errors}."
+
+    try:
+        # Try editing the original status message first
+        await status_message.edit(content=final_message_content)
+        print(f"DEBUG: [Scan G:{guild_id}] Successfully edited final status message.")
+    except discord.HTTPException as e:
+        # If editing fails (likely due to expired token 50027 or general 401), send a new message
+        print(f"DEBUG: [Scan G:{guild_id}] Editing status message failed (Status: {e.status}, Code: {e.code}, Text: '{e.text}'). Attempting to send new message.")
+        if e.code == 50027 or e.status == 401: # Specifically check for Invalid Webhook Token / Unauthorized
+            try:
+                # Attempt to delete the "Scanning..." message first (might also fail)
+                try:
+                    await status_message.delete()
+                    print(f"DEBUG: [Scan G:{guild_id}] Deleted original 'Scanning...' status message.")
+                    await asyncio.sleep(0.5) # Small delay before sending new
+                except Exception as del_e:
+                    # Log if deletion fails, but continue to sending the new message
+                    print(f"DEBUG: [Scan G:{guild_id}] Failed to delete original 'Scanning...' status message: {del_e}")
+
+                # Send the final status as a new message in the original channel
+                # Ensure the channel object is still valid
+                if interaction.channel:
+                     await interaction.channel.send(content=final_message_content)
+                     print(f"DEBUG: [Scan G:{guild_id}] Sent final status as a new message.")
+                else:
+                     print(f"ERROR: [Scan G:{guild_id}] interaction.channel is None, cannot send final status message.")
+                     # Log this error seriously
+
+            except discord.Forbidden:
+                 print(f"ERROR: [Scan G:{guild_id}] Missing permissions to send messages or delete in {channel.mention}.")
+                 # Optionally log this error via log_event if possible/needed
+            except Exception as send_e:
+                 print(f"ERROR: [Scan G:{guild_id}] Failed to send final status as new message: {send_e}")
+                 traceback.print_exc()
+                 # Optionally log this error
+        else:
+            # Handle other potential HTTP errors during edit if needed
+            print(f"ERROR: [Scan G:{guild_id}] An unexpected HTTP error occurred during final status edit: {e}")
+            traceback.print_exc()
+            # Optionally log this error
+    except Exception as final_edit_err:
+        # Catch any other non-HTTP error during the final edit attempt
+         print(f"ERROR: [Scan G:{guild_id}] A non-HTTP error occurred during final status edit attempt: {final_edit_err}")
+         traceback.print_exc()
+         # Attempt to send new message as fallback here too? Could be risky if status_message is invalid.
+         try:
+             if interaction.channel: await interaction.channel.send(content=f"⚠️ Scan finished, but encountered an error updating status. Details: {final_message_content}")
+         except Exception: pass # Best effort
 
 
 # --- New Clear Flags Command ---
@@ -980,45 +1112,98 @@ async def clear_flags(
     guild_id = interaction.guild_id
     guild_config = get_guild_config(guild_id)
     duplicate_reaction_emoji = guild_config.get('duplicate_reaction_emoji', '⚠️')
+    if not interaction.guild: await interaction.response.send_message("❌ Cannot determine guild.", ephemeral=True); return
     bot_member = interaction.guild.me
 
     # Check permissions
     if not channel.permissions_for(bot_member).read_message_history:
          await interaction.response.send_message(f"❌ Bot lacks 'Read Message History' in {channel.mention}.", ephemeral=True); return
-    if not channel.permissions_for(bot_member).add_reactions: # Need Add Reactions to remove own reactions
-         print(f"Warning: [ClearFlags G:{guild_id}] Bot might lack Add Reactions permission needed in {channel.mention}.")
+    # Need Manage Messages to remove reactions of *others* if bot loses track, but Add Reactions to remove *own*
+    if not channel.permissions_for(bot_member).manage_messages and not channel.permissions_for(bot_member).add_reactions:
+         await interaction.response.send_message(f"❌ Bot lacks 'Manage Messages' or 'Add Reactions' permission in {channel.mention}.", ephemeral=True); return
+    elif not channel.permissions_for(bot_member).add_reactions:
+         print(f"Warning: [ClearFlags G:{guild_id}] Bot might lack Add Reactions permission needed in {channel.mention} to remove its own reactions efficiently.")
 
-    await interaction.response.defer(ephemeral=False)
-    status_message = await interaction.followup.send(f"⏳ Starting reaction cleanup in {channel.mention} (limit {limit})...", wait=True)
+
+    await interaction.response.defer(ephemeral=False) # Defer publicly
+    status_message = await interaction.followup.send(f"⏳ Starting reaction cleanup ({duplicate_reaction_emoji}) in {channel.mention} (limit {limit})...", wait=True)
 
     processed_msgs = 0; reactions_removed = 0; errors = 0
+    final_status_content = "" # Define outside try/finally
     try:
         async for message in channel.history(limit=limit):
             processed_msgs += 1
             if processed_msgs % SCAN_UPDATE_INTERVAL == 0:
                 try: await status_message.edit(content=f"⏳ Clearing flags... Checked {processed_msgs}/{limit}. Removed {reactions_removed}.")
-                except Exception as e: print(f"DEBUG: Error editing status: {e}")
+                except Exception as e: print(f"DEBUG: Error editing status (ClearFlags): {e}") # Log error but continue
+
+            # Check reactions on the message
+            reaction_to_remove = None
             for reaction in message.reactions:
-                if str(reaction.emoji) == duplicate_reaction_emoji and reaction.me:
-                    try:
-                        await message.remove_reaction(duplicate_reaction_emoji, bot_member)
-                        reactions_removed += 1
-                        await asyncio.sleep(CLEAR_REACTION_DELAY)
-                    except discord.Forbidden: print(f"Warning: [ClearFlags G:{guild_id}] Missing permission to remove reaction in {channel.mention}.")
-                    except discord.NotFound: print(f"Warning: [ClearFlags G:{guild_id}] Message {message.id} or reaction not found.")
-                    except Exception as e: print(f"Error: [ClearFlags G:{guild_id}] Failed to remove reaction from {message.id}: {e}"); errors += 1
-                    break
-    except discord.Forbidden: await status_message.edit(content=f"❌ Cleanup failed. Bot lacks permissions in {channel.mention}."); return
-    except Exception as e: await status_message.edit(content=f"❌ Error during cleanup: {e}"); traceback.print_exc(); return
-    await status_message.edit(content=f"✅ Cleanup Complete! Checked {processed_msgs} messages in {channel.mention}. Removed **{reactions_removed}** reactions. Errors: {errors}.")
+                 # Ensure emoji comparison works for standard and custom emojis
+                 if str(reaction.emoji) == duplicate_reaction_emoji:
+                     if reaction.me: # Found the bot's reaction
+                         reaction_to_remove = reaction
+                         break
+
+            if reaction_to_remove:
+                 try:
+                     # Use remove_reaction with the specific bot user
+                     await message.remove_reaction(reaction_to_remove.emoji, bot_member)
+                     reactions_removed += 1
+                     await asyncio.sleep(CLEAR_REACTION_DELAY) # Be nice to the API
+                 except discord.Forbidden:
+                     print(f"Warning: [ClearFlags G:{guild_id}] Missing permission to remove reaction in {channel.mention} (Msg ID: {message.id}). Stopping for this channel.")
+                     errors += 1
+                     final_status_content = f"⚠️ Cleanup stopped due to permission error in {channel.mention}. Checked {processed_msgs}. Removed {reactions_removed}."
+                     break # Stop processing this channel if permission is lost
+                 except discord.NotFound:
+                     print(f"Warning: [ClearFlags G:{guild_id}] Message {message.id} or reaction not found.")
+                     # Don't increment error count, just note it.
+                 except Exception as e:
+                     print(f"Error: [ClearFlags G:{guild_id}] Failed to remove reaction from {message.id}: {e}")
+                     errors += 1
+                     # Continue to next message
+
+        if not final_status_content: # If loop completed without breaking due to permissions
+             final_status_content = f"✅ Cleanup Complete! Checked {processed_msgs} messages in {channel.mention}. Removed **{reactions_removed}** '{duplicate_reaction_emoji}' reactions. Errors: {errors}."
+
+    except discord.Forbidden:
+        final_status_content = f"❌ Cleanup failed. Bot lacks Read Message History permission in {channel.mention}."
+        errors += 1
+    except Exception as e:
+        final_status_content = f"❌ Error during cleanup: {e}"
+        traceback.print_exc()
+        errors += 1
+    finally:
+        # --- Final status update for clearflags (using fallback similar to scan) ---
+        try:
+             await status_message.edit(content=final_status_content)
+        except discord.HTTPException as e_http:
+             print(f"DEBUG: [ClearFlags G:{guild_id}] Editing final status failed (Status: {e_http.status}, Code: {e_http.code}). Sending new message.")
+             if e_http.code == 50027 or e_http.status == 401:
+                 try:
+                     await status_message.delete() # Try deleting old status
+                 except Exception: pass
+                 try:
+                     if interaction.channel: await interaction.channel.send(content=final_status_content)
+                 except Exception as e_send: print(f"ERROR: [ClearFlags G:{guild_id}] Failed to send final status as new message: {e_send}")
+             else:
+                 print(f"ERROR: [ClearFlags G:{guild_id}] An unexpected HTTP error occurred during final status edit: {e_http}")
+        except Exception as e_final:
+             print(f"ERROR: [ClearFlags G:{guild_id}] A non-HTTP error occurred during final status edit: {e_final}")
+             try: # Best effort fallback
+                 if interaction.channel: await interaction.channel.send(content=final_status_content)
+             except Exception: pass
+
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
     try: import dateutil.parser
     except ImportError: print("Optional dependency 'python-dateutil' not found. Timestamps might not parse correctly. Consider: pip install python-dateutil")
-    if BOT_TOKEN is None: print("Error: DISCORD_BOT_TOKEN not found.", file=sys.stderr); sys.exit(1)
+    if BOT_TOKEN is None: print("Error: DISCORD_BOT_TOKEN not found in environment variables or .env file.", file=sys.stderr); sys.exit(1)
     try: print("Starting bot..."); bot.run(BOT_TOKEN)
-    except Exception as e: print(f"An error occurred: {e}", file=sys.stderr); traceback.print_exc()
-    finally: print("DEBUG: Bot run loop finished or encountered an error.")
-
+    except discord.LoginFailure: print("Error: Improper token passed. Ensure DISCORD_BOT_TOKEN is correct.", file=sys.stderr)
+    except Exception as e: print(f"An error occurred while starting or running the bot: {e}", file=sys.stderr); traceback.print_exc()
+    finally: print("--- Bot process ended. ---")
