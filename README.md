@@ -1,5 +1,4 @@
-# Discord Duplicate Image Detection Bot (Slash Commands)
-
+# Discord Duplicate Image Detection Bot V3
 ## Overview
 
 This Discord bot helps server administrators detect and manage duplicate or near-duplicate images posted by users. It's particularly useful for scenarios like verifying unique submissions (e.g., proof screenshots for contests or tasks).
