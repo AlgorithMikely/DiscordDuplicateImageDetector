@@ -25,3 +25,4 @@ server_configs.json
 /.idea/shelf/Updated_gitignore.xml
 /.idea/vcs.xml
 /.idea/workspace.xml
+/last_seen.json

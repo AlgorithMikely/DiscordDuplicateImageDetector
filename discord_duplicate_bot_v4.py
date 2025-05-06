@@ -240,7 +240,7 @@ async def save_guild_config(guild_id, guild_config_data):
     return await save_main_config()
 
 
-# --- Hashing and File I/O Functions --- (No changes needed)
+# --- Hashing and File I/O Functions ---
 
 def get_hash_file_lock(guild_id):
     global hash_file_locks
@@ -297,7 +297,7 @@ async def save_guild_hashes(guild_id, hashes_dict, loop):
         active_hash_databases[guild_id] = hashes_dict.copy()
     return success
 
-# --- Duplicate Finding --- (No changes needed)
+# --- Duplicate Finding ---
 
 def find_existing_hash_entry_sync(target_hash, stored_hashes_dict, threshold, scope, channel_id_str):
     if target_hash is None: return None, None
@@ -369,7 +369,7 @@ async def find_duplicates(new_image_hash, stored_hashes_dict, threshold, scope, 
     return duplicates
 
 
-# --- Logging Helper --- (No changes needed)
+# --- Logging Helper ---
 async def log_event(guild: discord.Guild, embed: discord.Embed):
     if not guild: return
     guild_config = get_guild_config(guild.id)
@@ -697,84 +697,151 @@ async def config_view(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 async def _update_config(interaction: discord.Interaction, setting: str, new_value: typing.Any):
-    if not interaction.guild_id: return False
+    """Helper to update and save config, sending response VIA FOLLOWUP."""
+    # This function assumes interaction has already been deferred by the calling command.
+    if not interaction.guild_id:
+        # This case should ideally not be reached if commands defer properly.
+        # If it is, sending a response might fail if one was already sent.
+        print("ERROR: _update_config called without guild_id.")
+        try:
+            await interaction.response.send_message("❌ Internal error: Missing server context.", ephemeral=True)
+        except discord.InteractionResponded:
+            await interaction.followup.send("❌ Internal error: Missing server context.", ephemeral=True)
+        return
+
     guild_id = interaction.guild_id
     guild_config = get_guild_config(guild_id).copy()
     original_value = guild_config.get(setting)
-    if str(original_value) == str(new_value): await interaction.response.send_message(f"ℹ️ '{setting}' already set to `{new_value}`.", ephemeral=True); return False
+
+    if str(original_value) == str(new_value):
+        await interaction.followup.send(f"ℹ️ Setting '{setting}' is already set to `{new_value}`.", ephemeral=True)
+        return
+
     guild_config[setting] = new_value
     if await save_guild_config(guild_id, guild_config):
-        display_orig = original_value; display_new = new_value
-        if setting == 'duplicate_check_duration_days': display_orig = f"{original_value} days" if original_value > 0 else "Forever"; display_new = f"{new_value} days" if new_value > 0 else "Forever"
-        elif setting == 'duplicate_reply_template': display_orig = f"```\n{original_value}\n```" if original_value else "`Default`"; display_new = f"```\n{new_value}\n```"
-        elif setting == 'log_channel_id': display_orig = f"<#{original_value}>" if original_value else "`None`"; display_new = f"<#{new_value}>" if new_value else "`None`"
-        elif isinstance(new_value, bool): display_orig = "`Enabled`" if original_value else "`Disabled`"; display_new = "`Enabled`" if new_value else "`Disabled`"
-        else: display_orig = f"`{original_value}`"; display_new = f"`{new_value}`"
-        await interaction.response.send_message(f"✅ Updated '{setting}' from {display_orig} to {display_new}.", ephemeral=True)
-        if setting == 'duplicate_scope': await interaction.followup.send(f"⚠️ Warning: Changing scope might affect hash lookup.", ephemeral=True)
-        # Removed the specific warning about catch-up here, as it now works with None
-        # if setting == 'allowed_channel_ids' and not new_value: await interaction.followup.send(f"ℹ️ Note: Catch-up on startup requires specific channels listed here; it's now disabled for this server.", ephemeral=True)
-        return True
-    else: await interaction.response.send_message(f"⚠️ Failed save config for '{setting}'.", ephemeral=True); return False
+        display_new = new_value
+        display_orig = original_value
+        if setting == 'duplicate_check_duration_days':
+            display_orig = f"{original_value} days" if original_value is not None and original_value > 0 else "Forever"
+            display_new = f"{new_value} days" if new_value > 0 else "Forever"
+        elif setting == 'duplicate_reply_template':
+            display_orig = f"```\n{original_value}\n```" if original_value else "`Default`"
+            display_new = f"```\n{new_value}\n```"
+        elif setting == 'log_channel_id':
+            display_orig = f"<#{original_value}>" if original_value else "`None`"
+            display_new = f"<#{new_value}>" if new_value else "`None`"
+        elif isinstance(new_value, bool):
+            display_orig = "`Enabled`" if bool(original_value) else "`Disabled`"
+            display_new = "`Enabled`" if new_value else "`Disabled`"
+        else:
+            display_orig = f"`{original_value}`"
+            display_new = f"`{new_value}`"
+
+        await interaction.followup.send(f"✅ Updated '{setting}' from {display_orig} to {display_new}.", ephemeral=True)
+        if setting == 'duplicate_scope':
+            await interaction.followup.send(f"⚠️ **Warning:** Changing scope might affect hash lookup.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"⚠️ Failed to save config update for '{setting}'.", ephemeral=True)
 
 @bot.slash_command(name="config_set_threshold", description="Sets similarity threshold (0-20, lower is stricter).")
 async def config_set_threshold(interaction: discord.Interaction, value: discord.Option(int, "Threshold (0=exact match).", min_value=0, max_value=20)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "similarity_threshold", value)
 
 @bot.slash_command(name="config_set_hash_size", description="Sets hash detail level (e.g., 8, 16). Higher needs more CPU.")
 async def config_set_hash_size(interaction: discord.Interaction, value: discord.Option(int, "Hash size (power of 2, >= 4).", min_value=4, max_value=32)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
-    if not (value & (value - 1) == 0) and value != 0: await interaction.response.send_message("⚠️ Warning: Hash size non-standard (use 4, 8, 16, 32).", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not (value & (value - 1) == 0) and value != 0:
+        await interaction.followup.send("⚠️ Warning: Hash size non-standard (use 4, 8, 16, 32). Setting anyway...", ephemeral=True)
     await _update_config(interaction, "hash_size", value)
 
 @bot.slash_command(name="config_set_react", description="Enable/disable reacting to new duplicates.")
 async def config_set_react(interaction: discord.Interaction, value: discord.Option(bool, "Enable reactions?")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "react_to_duplicates", value)
 
 @bot.slash_command(name="config_set_delete", description="Enable/disable deleting new duplicates.")
 async def config_set_delete(interaction: discord.Interaction, value: discord.Option(bool, "Enable deletion?")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "delete_duplicates", value)
 
 @bot.slash_command(name="config_set_reply", description="Enable/disable replying to new duplicates.")
 async def config_set_reply(interaction: discord.Interaction, value: discord.Option(bool, "Enable replies?")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "reply_on_duplicate", value)
 
 @bot.slash_command(name="config_set_emoji", description="Sets the emoji for duplicate reactions.")
 async def config_set_emoji(interaction: discord.Interaction, value: discord.Option(str, "The new emoji.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
-    try:
-        await interaction.response.defer(ephemeral=True); test_msg = await interaction.followup.send("Testing emoji...", ephemeral=True)
-        await test_msg.add_reaction(value); await test_msg.delete()
-    except discord.HTTPException as e: await interaction.edit_original_response(content=f"❌ Invalid/inaccessible emoji: {e.text}"); return
-    except Exception as e: await interaction.edit_original_response(content=f"❌ Error testing emoji: {e}"); return
-    await _update_config(interaction, "duplicate_reaction_emoji", value)
+    if not interaction.guild: await interaction.response.send_message("❌ Guild context unavailable.", ephemeral=True); return # Should not happen
+
+    await interaction.response.defer(ephemeral=True)
+
+    test_message_object = None
+    emoji_is_valid = False
+
+    if interaction.channel and \
+            interaction.channel.permissions_for(interaction.guild.me).send_messages and \
+            interaction.channel.permissions_for(interaction.guild.me).add_reactions and \
+            interaction.channel.permissions_for(interaction.guild.me).manage_messages:
+        try:
+            test_message_object = await interaction.channel.send(f"Testing emoji: {value}")
+            await test_message_object.add_reaction(value)
+            await asyncio.sleep(0.5) # Brief pause
+            await test_message_object.delete()
+            emoji_is_valid = True
+        except discord.HTTPException as e:
+            error_message = f"❌ Invalid/inaccessible emoji, or bot lacks perms to react/delete test messages. Error: {e.text}"
+            if test_message_object:
+                try: await test_message_object.delete()
+                except: pass
+            await interaction.followup.send(content=error_message, ephemeral=True)
+            return
+        except Exception as e:
+            error_message = f"❌ Error testing emoji: {e}"
+            if test_message_object:
+                try: await test_message_object.delete()
+                except: pass
+            await interaction.followup.send(content=error_message, ephemeral=True)
+            return
+    else:
+        await interaction.followup.send("⚠️ Could not perform live emoji test (missing perms/channel context). Setting config directly.", ephemeral=True)
+        emoji_is_valid = True # Assume valid
+
+    if emoji_is_valid:
+        await _update_config(interaction, "duplicate_reaction_emoji", value)
+
 
 @bot.slash_command(name="config_set_scope", description="Sets duplicate check scope (server or channel).")
 async def config_set_scope(interaction: discord.Interaction, value: discord.Option(str, "Choose scope.", choices=VALID_SCOPES)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "duplicate_scope", value)
 
 @bot.slash_command(name="config_set_check_mode", description="Sets duplicate check mode (strict or owner_allowed).")
 async def config_set_check_mode(interaction: discord.Interaction, value: discord.Option(str, "Choose check mode.", choices=VALID_CHECK_MODES)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "duplicate_check_mode", value)
 
 @bot.slash_command(name="config_set_duration", description="Sets how many days back to check for duplicates (0=forever).")
 async def config_set_duration(interaction: discord.Interaction, value: discord.Option(int, "Number of days (0 for forever).", min_value=0)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "duplicate_check_duration_days", value)
 
 @bot.slash_command(name="config_set_log_channel", description="Sets or clears the channel for logging duplicates.")
@@ -782,25 +849,40 @@ async def config_set_log_channel(interaction: discord.Interaction, channel: disc
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
     if not interaction.guild: await interaction.response.send_message("❌ Cannot determine guild context.", ephemeral=True); return
+
+    await interaction.response.defer(ephemeral=True)
     new_channel_id = channel.id if channel else None
     if new_channel_id:
-        log_channel = interaction.guild.get_channel(new_channel_id)
-        if not log_channel or not isinstance(log_channel, discord.TextChannel): await interaction.response.send_message("❌ Invalid channel.", ephemeral=True); return
+        log_channel_obj = interaction.guild.get_channel(new_channel_id) # Use guild.get_channel
+        if not log_channel_obj or not isinstance(log_channel_obj, discord.TextChannel):
+            await interaction.followup.send("❌ Invalid channel specified.", ephemeral=True); return
         bot_member = interaction.guild.me
-        if not log_channel.permissions_for(bot_member).send_messages or not log_channel.permissions_for(bot_member).embed_links: await interaction.response.send_message(f"❌ Bot lacks Send/Embed perms in {channel.mention}.", ephemeral=True); return
-        try: await log_channel.send(embed=discord.Embed(description=f"✅ Log channel set by {interaction.user.mention}.", color=discord.Color.green()))
-        except Exception as e: print(f"Warning: [G:{interaction.guild_id}] Failed confirmation send to log channel {new_channel_id}: {e}")
+        if not log_channel_obj.permissions_for(bot_member).send_messages or \
+                not log_channel_obj.permissions_for(bot_member).embed_links:
+            await interaction.followup.send(f"❌ Bot lacks Send/Embed perms in {channel.mention}.", ephemeral=True); return
+        try:
+            await log_channel_obj.send(embed=discord.Embed(description=f"✅ Log channel set by {interaction.user.mention}.", color=discord.Color.green()))
+        except Exception as e:
+            print(f"Warning: [G:{interaction.guild_id}] Failed confirmation send to log channel {new_channel_id}: {e}")
+
     await _update_config(interaction, "log_channel_id", new_channel_id)
+
 
 @bot.slash_command(name="config_set_reply_template", description="Sets the template for duplicate reply messages.")
 async def config_set_reply_template(interaction: discord.Interaction, template: discord.Option(str, "Template string. Use {placeholders}. Max 1500 chars.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
-    if not isinstance(template, str): await interaction.response.send_message("❌ Template must be string.", ephemeral=True); return
-    if len(template) > 1500: await interaction.response.send_message("❌ Template too long (max 1500 chars).", ephemeral=True); return
-    if template.count('{') != template.count('}'): await interaction.response.send_message("⚠️ Warning: Unbalanced braces `{}`.", ephemeral=True)
-    if await _update_config(interaction, "duplicate_reply_template", template):
-        await interaction.followup.send(f"ℹ️ Placeholders: `{{mention}}`, `{{filename}}`, `{{identifier}}`, `{{distance}}`, `{{original_user_mention}}`, `{{emoji}}`, `{{original_user_info}}`, `{{jump_link}}`", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    if not isinstance(template, str): await interaction.followup.send("❌ Template must be string.", ephemeral=True); return
+    if len(template) > 1500: await interaction.followup.send("❌ Template too long (max 1500 chars).", ephemeral=True); return
+    if template.count('{') != template.count('}'):
+        # Send warning but still proceed to update
+        await interaction.followup.send("⚠️ Warning: Template has unbalanced curly braces `{}`. Setting anyway.", ephemeral=True)
+
+    # _update_config will send the primary confirmation
+    await _update_config(interaction, "duplicate_reply_template", template)
+    # Send placeholder info as a separate followup, as _update_config already sent one.
+    await interaction.followup.send(f"ℹ️ Placeholders: `{{mention}}`, `{{filename}}`, `{{identifier}}`, `{{distance}}`, `{{original_user_mention}}`, `{{emoji}}`, `{{original_user_info}}`, `{{jump_link}}`", ephemeral=True)
 
 # --- Catch-up Config Commands ---
 
@@ -808,12 +890,14 @@ async def config_set_reply_template(interaction: discord.Interaction, template: 
 async def config_set_catchup_enabled(interaction: discord.Interaction, value: discord.Option(bool, "Enable catch-up?")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "enable_catchup_on_startup", value)
 
 @bot.slash_command(name="config_set_catchup_limit", description="Sets max messages to check per channel during startup catch-up.")
 async def config_set_catchup_limit(interaction: discord.Interaction, value: discord.Option(int, "Max messages per channel (e.g., 100).", min_value=10, max_value=1000)):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True)
     await _update_config(interaction, "catchup_limit_per_channel", value)
 
 
@@ -825,48 +909,50 @@ async def config_channel_view(interaction: discord.Interaction):
     if not await check_admin_permissions(interaction): return
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id); channel_list = guild_config.get('allowed_channel_ids')
     if channel_list: await interaction.response.send_message(embed=discord.Embed(title=f"Monitored Channels for {interaction.guild.name}", description='\n'.join(f"- <#{ch_id}> (`{ch_id}`)" for ch_id in channel_list), color=discord.Color.blue()), ephemeral=True)
-    else: await interaction.response.send_message("ℹ️ Monitoring all channels for new posts (Catch-up also uses all channels).", ephemeral=True) # Updated message
+    else: await interaction.response.send_message("ℹ️ Monitoring all channels for new posts (Catch-up also uses all channels).", ephemeral=True)
 
 @bot.slash_command(name="config_channel_add", description="Adds a channel to monitor.")
 async def config_channel_add(interaction: discord.Interaction, channel: discord.Option(discord.TextChannel, "Channel to monitor.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True) # Defer for _update_config
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); channel_id = channel.id
     allowed_channels = guild_config.get('allowed_channel_ids', [])
     if allowed_channels is None: allowed_channels = []
     if channel_id not in allowed_channels:
         allowed_channels.append(channel_id)
         guild_config['allowed_channel_ids'] = allowed_channels
-        if await save_guild_config(guild_id, guild_config): await interaction.response.send_message(f"✅ Added {channel.mention} to monitored channels.", ephemeral=True)
-        else: await interaction.response.send_message(f"⚠️ Failed save config.", ephemeral=True)
-    else: await interaction.response.send_message(f"ℹ️ {channel.mention} already monitored.", ephemeral=True)
+        # Use _update_config to handle the response after deferring
+        await _update_config(interaction, "allowed_channel_ids", allowed_channels)
+    else: await interaction.followup.send(f"ℹ️ {channel.mention} already monitored.", ephemeral=True)
+
 
 @bot.slash_command(name="config_channel_remove", description="Removes a channel from monitoring.")
 async def config_channel_remove(interaction: discord.Interaction, channel: discord.Option(discord.TextChannel, "Channel to stop monitoring.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True) # Defer for _update_config
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); channel_id = channel.id
     allowed_channels = guild_config.get('allowed_channel_ids')
     if allowed_channels and channel_id in allowed_channels:
         allowed_channels.remove(channel_id);
-        guild_config['allowed_channel_ids'] = allowed_channels if allowed_channels else None
-        if await save_guild_config(guild_id, guild_config):
-            msg = f"✅ Removed {channel.mention}." + (" Now monitoring all channels." if guild_config['allowed_channel_ids'] is None else "") # Updated message
-            await interaction.response.send_message(msg, ephemeral=True)
-        else: await interaction.response.send_message(f"⚠️ Failed save config.", ephemeral=True)
-    elif allowed_channels is None: await interaction.response.send_message(f"ℹ️ Monitoring all channels. Cannot remove {channel.mention}.", ephemeral=True)
-    else: await interaction.response.send_message(f"ℹ️ {channel.mention} not in monitored list.", ephemeral=True)
+        new_value = allowed_channels if allowed_channels else None
+        # Use _update_config to handle the response after deferring
+        await _update_config(interaction, "allowed_channel_ids", new_value)
+        # Followup with additional info if needed
+        if new_value is None:
+            await interaction.followup.send("ℹ️ Now monitoring all channels.", ephemeral=True)
+    elif allowed_channels is None: await interaction.followup.send(f"ℹ️ Currently monitoring all channels. Cannot remove {channel.mention}.", ephemeral=True)
+    else: await interaction.followup.send(f"ℹ️ {channel.mention} not in monitored list.", ephemeral=True)
 
 @bot.slash_command(name="config_channel_clear", description="Clears monitored channels (monitors all for new posts & catch-up).")
 async def config_channel_clear(interaction: discord.Interaction):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
-    guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy()
-    if guild_config.get('allowed_channel_ids') is not None:
-        guild_config['allowed_channel_ids'] = None
-        if await save_guild_config(guild_id, guild_config): await interaction.response.send_message("✅ Cleared specific channel monitoring. Now monitoring all channels (for new posts and catch-up).", ephemeral=True) # Updated message
-        else: await interaction.response.send_message(f"⚠️ Failed save config.", ephemeral=True)
-    else: await interaction.response.send_message("ℹ️ Already monitoring all channels.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True) # Defer for _update_config
+    # Use _update_config to handle the response after deferring
+    await _update_config(interaction, "allowed_channel_ids", None)
+
 
 # --- Allowlist Commands ---
 
@@ -888,26 +974,28 @@ async def allowlist_view(interaction: discord.Interaction):
 async def allowlist_add(interaction: discord.Interaction, user: discord.Option(discord.User, "User to allowlist.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True) # Defer for _update_config
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); user_id = user.id
     allowed_users = guild_config.get('allowed_users', [])
     if allowed_users is None: allowed_users = []
     if user_id not in allowed_users:
-        allowed_users.append(user_id); guild_config['allowed_users'] = allowed_users
-        if await save_guild_config(guild_id, guild_config): await interaction.response.send_message(f"✅ Added {user.mention} to allowlist.", ephemeral=True)
-        else: await interaction.response.send_message(f"⚠️ Failed save.", ephemeral=True)
-    else: await interaction.response.send_message(f"ℹ️ {user.mention} already allowlisted.", ephemeral=True)
+        allowed_users.append(user_id)
+        # Use _update_config to handle the response after deferring
+        await _update_config(interaction, "allowed_users", allowed_users)
+    else: await interaction.followup.send(f"ℹ️ {user.mention} already allowlisted.", ephemeral=True)
 
 @bot.slash_command(name="allowlist_remove", description="Removes a user from the allowlist.")
 async def allowlist_remove(interaction: discord.Interaction, user: discord.Option(discord.User, "User to remove.")):
     if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
     if not await check_admin_permissions(interaction): return
+    await interaction.response.defer(ephemeral=True) # Defer for _update_config
     guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id).copy(); user_id = user.id
     allowed_users = guild_config.get('allowed_users')
     if allowed_users and user_id in allowed_users:
-        allowed_users.remove(user_id); guild_config['allowed_users'] = allowed_users
-        if await save_guild_config(guild_id, guild_config): await interaction.response.send_message(f"✅ Removed {user.mention} from allowlist.", ephemeral=True)
-        else: await interaction.response.send_message(f"⚠️ Failed save.", ephemeral=True)
-    else: await interaction.response.send_message(f"ℹ️ {user.mention} not allowlisted.", ephemeral=True)
+        allowed_users.remove(user_id)
+        # Use _update_config to handle the response after deferring
+        await _update_config(interaction, "allowed_users", allowed_users)
+    else: await interaction.followup.send(f"ℹ️ {user.mention} not allowlisted.", ephemeral=True)
 
 
 # --- Hash Management Commands ---
@@ -1013,9 +1101,9 @@ async def scan_history(
     if delete_duplicates and not channel.permissions_for(bot_member).manage_messages: perms_needed.append("Manage Messages")
     if log_scan_duplicates and not log_channel_id: await interaction.response.send_message(f"❌ Logging requested, but no log channel configured.", ephemeral=True); return
     if log_scan_duplicates and log_channel_id:
-        log_channel = interaction.guild.get_channel(log_channel_id)
-        if not log_channel or not isinstance(log_channel, discord.TextChannel): perms_needed.append(f"Access Log Channel ({log_channel_id})")
-        elif not log_channel.permissions_for(bot_member).send_messages or not log_channel.permissions_for(bot_member).embed_links: perms_needed.append(f"Send/Embed in Log ({log_channel.mention})")
+        log_channel_obj = interaction.guild.get_channel(log_channel_id) # Renamed to avoid conflict
+        if not log_channel_obj or not isinstance(log_channel_obj, discord.TextChannel): perms_needed.append(f"Access Log Channel ({log_channel_id})")
+        elif not log_channel_obj.permissions_for(bot_member).send_messages or not log_channel_obj.permissions_for(bot_member).embed_links: perms_needed.append(f"Send/Embed in Log ({log_channel_obj.mention})")
     if perms_needed: await interaction.response.send_message(f"❌ Bot lacks permissions ({', '.join(perms_needed)}).", ephemeral=True); return
 
     await interaction.response.defer(ephemeral=False)
@@ -1080,7 +1168,7 @@ async def scan_history(
     for img_hash_str, entries in scanned_image_data.items():
         processed_hashes += 1
         if processed_hashes % (SCAN_UPDATE_INTERVAL * 2) == 0:
-            status_text = (f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. A:{added_hashes} U:{updated_hashes} R:{replied_count} F:{flagged_count} D:{deleted_count} L:{logged_count}")
+            status_text = (f"⏳ Processing... {processed_hashes}/{len(scanned_image_data)} hashes. Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, Flagged:{flagged_count}, Deleted:{deleted_count}, Logged:{logged_count}")
             try:
                 await status_message.edit(content=status_text)
             except Exception as e:
@@ -1098,53 +1186,93 @@ async def scan_history(
             if isinstance(existing_data, dict):
                 existing_timestamp_str = existing_data.get('timestamp')
             if existing_timestamp_str:
-                try: existing_time = dateutil.parser.isoparse(existing_timestamp_str).replace(tzinfo=datetime.timezone.utc); update_needed = oldest_timestamp < existing_time
-                except Exception as parse_e: print(f"Warning: [Scan G:{guild_id}] Error parsing DB time '{existing_timestamp_str}': {parse_e}. Update needed."); update_needed = True
-            else: update_needed = True
-            if not update_needed: identifier_to_use = existing_identifier; data_to_use = existing_data
-        else: update_needed = True
+                try:
+                    existing_time = dateutil.parser.isoparse(existing_timestamp_str).replace(tzinfo=datetime.timezone.utc)
+                    update_needed = oldest_timestamp < existing_time
+                except Exception as parse_e:
+                    print(f"Warning: [Scan G:{guild_id}] Error parsing DB time '{existing_timestamp_str}': {parse_e}. Update needed.")
+                    update_needed = True
+            else:
+                update_needed = True # Existing entry has no timestamp (old format?), update it
+            if not update_needed: # DB entry is older or same age
+                identifier_to_use = existing_identifier
+                data_to_use = existing_data
+        else: # Hash not found in DB at all
+            update_needed = True
+
         if update_needed:
             guild_db_updated = True
-            if existing_identifier and oldest_timestamp < (existing_time or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)): updated_hashes += 1
-            elif not existing_identifier: added_hashes += 1
+            if existing_identifier and oldest_timestamp < (existing_time or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)):
+                updated_hashes += 1
+            elif not existing_identifier:
+                added_hashes += 1
+
             if current_scope == "server":
                 if not isinstance(stored_hashes, dict): stored_hashes = {}
-                if existing_identifier and existing_identifier != identifier_to_use: stored_hashes.pop(existing_identifier, None)
+                if existing_identifier and existing_identifier != identifier_to_use:
+                    stored_hashes.pop(existing_identifier, None)
                 stored_hashes[identifier_to_use] = data_to_use
             elif current_scope == "channel":
                 if not isinstance(stored_hashes, dict): stored_hashes = {}
                 channel_hashes = stored_hashes.setdefault(scan_channel_id_str, {});
                 if not isinstance(channel_hashes, dict): channel_hashes = {}; stored_hashes[scan_channel_id_str] = channel_hashes
-                if existing_identifier and existing_identifier != identifier_to_use: channel_hashes.pop(existing_identifier, None)
+                if existing_identifier and existing_identifier != identifier_to_use:
+                    channel_hashes.pop(existing_identifier, None)
                 channel_hashes[identifier_to_use] = data_to_use
-        canonical_oldest_id = identifier_to_use; canonical_oldest_user_id = data_to_use.get('user_id'); canonical_oldest_msg_obj = oldest_message_obj if identifier_to_use == oldest_identifier else None
+
+        canonical_oldest_id = identifier_to_use
+        canonical_oldest_user_id = data_to_use.get('user_id')
+        canonical_oldest_msg_obj = oldest_message_obj if identifier_to_use == oldest_identifier else None
+
         for entry_timestamp, entry_msg_id, entry_user_id, entry_filename, entry_message_obj in entries:
             if entry_msg_id == int(canonical_oldest_id.split('-')[0]): continue
             is_violation = False
-            if current_mode == "strict": is_violation = True
-            elif current_mode == "owner_allowed": is_violation = canonical_oldest_user_id is None or canonical_oldest_user_id != entry_user_id
+            if current_mode == "strict":
+                is_violation = True
+            elif current_mode == "owner_allowed":
+                is_violation = canonical_oldest_user_id is None or canonical_oldest_user_id != entry_user_id
+
             if is_violation and current_duration > 0:
-                try: canonical_oldest_time = dateutil.parser.isoparse(data_to_use.get('timestamp')).replace(tzinfo=datetime.timezone.utc); is_violation = (entry_timestamp - canonical_oldest_time).days <= current_duration
-                except Exception: is_violation = False
+                try:
+                    canonical_oldest_time = dateutil.parser.isoparse(data_to_use.get('timestamp')).replace(tzinfo=datetime.timezone.utc)
+                    if (entry_timestamp - canonical_oldest_time).days > current_duration:
+                        is_violation = False
+                except Exception:
+                    is_violation = False # Error parsing time, assume not violation for safety
+
             if is_violation:
                 action_taken = False
                 if log_scan_duplicates and interaction.guild:
                     log_embed = discord.Embed(title="Duplicate Detected (Scan)", color=discord.Color.orange(), timestamp=datetime.datetime.now(datetime.timezone.utc))
-                    log_embed.add_field(name="Dup User", value=f"<@{entry_user_id}> (`{entry_user_id}`)", inline=True); log_embed.add_field(name="Channel", value=channel.mention, inline=True)
-                    try: log_embed.add_field(name="Dup Msg", value=f"[Link]({entry_message_obj.jump_url})", inline=True)
-                    except: log_embed.add_field(name="Dup Msg", value=f"`{entry_msg_id}`", inline=True)
-                    log_embed.add_field(name="Hash", value=f"`{img_hash_str}`", inline=False); log_embed.add_field(name="Match ID", value=f"`{canonical_oldest_id}`", inline=True); log_embed.add_field(name="Dist", value="0", inline=True)
-                    orig_user_mention = f"<@{canonical_oldest_user_id}> (`{canonical_oldest_user_id}`)" if canonical_oldest_user_id else "Unknown"; log_embed.add_field(name="Orig User", value=orig_user_mention, inline=True)
+                    log_embed.add_field(name="Dup User", value=f"<@{entry_user_id}> (`{entry_user_id}`)", inline=True)
+                    log_embed.add_field(name="Channel", value=channel.mention, inline=True)
+                    try:
+                        log_embed.add_field(name="Dup Msg", value=f"[Link]({entry_message_obj.jump_url})", inline=True)
+                    except: # Fallback if jump_url fails
+                        log_embed.add_field(name="Dup Msg", value=f"`{entry_msg_id}`", inline=True)
+
+                    log_embed.add_field(name="Hash", value=f"`{img_hash_str}`", inline=False)
+                    log_embed.add_field(name="Match ID", value=f"`{canonical_oldest_id}`", inline=True)
+                    log_embed.add_field(name="Dist", value="0", inline=True) # Scan implies exact hash match for grouping
+                    orig_user_mention = f"<@{canonical_oldest_user_id}> (`{canonical_oldest_user_id}`)" if canonical_oldest_user_id else "Unknown"
+                    log_embed.add_field(name="Orig User", value=orig_user_mention, inline=True)
                     original_msg_link = None
                     try:
                         original_msg_link = canonical_oldest_msg_obj.jump_url if canonical_oldest_msg_obj else f"https://discord.com/channels/{guild_id}/{scan_channel_id}/{int(canonical_oldest_id.split('-')[0])}"
                     except:
-                        pass # Ignore errors building link
-                    if original_msg_link: log_embed.add_field(name="Orig Msg", value=f"[Link]({original_msg_link})", inline=False)
+                        pass
+                    if original_msg_link:
+                        log_embed.add_field(name="Orig Msg", value=f"[Link]({original_msg_link})", inline=False)
+
                     thumb_url = next((att.url for att in entry_message_obj.attachments if att.content_type and att.content_type.startswith('image/')), None)
                     if thumb_url:
                         log_embed.set_thumbnail(url=thumb_url)
-                    log_embed.set_footer(text=f"Scan by: {interaction.user.name} | Guild: {guild_id}"); await log_event(interaction.guild, log_embed); logged_count += 1; action_taken = True
+
+                    log_embed.set_footer(text=f"Scan by: {interaction.user.name} | Guild: {guild_id}")
+                    await log_event(interaction.guild, log_embed)
+                    logged_count += 1
+                    action_taken = True
+
                 if reply_on_scan_duplicate_config and reply_to_duplicates:
                     try:
                         template_data = { "mention": f"<@{entry_user_id}>", "filename": entry_filename, "identifier": canonical_oldest_id, "distance": 0, "original_user_mention": f"<@{canonical_oldest_user_id}>" if canonical_oldest_user_id else "*Unknown*", "emoji": duplicate_reaction_emoji, "original_user_info": f", Orig User: <@{canonical_oldest_user_id}>" if canonical_oldest_user_id else "", "jump_link": "" }
@@ -1156,10 +1284,14 @@ async def scan_history(
                             try:
                                 template_data["jump_link"] = f"\nOriginal: https://discord.com/channels/{guild_id}/{scan_channel_id}/{int(canonical_oldest_id.split('-')[0])}"
                             except: pass
-                        reply_text = reply_template.format_map(defaultdict(str, template_data)); await entry_message_obj.reply(reply_text, mention_author=False); replied_count += 1; action_taken = True
+                        reply_text = reply_template.format_map(defaultdict(str, template_data))
+                        await entry_message_obj.reply(reply_text, mention_author=False)
+                        replied_count += 1
+                        action_taken = True
                     except discord.Forbidden: print(f"Warning: [Scan G:{guild_id}] No Send perm reply {entry_msg_id}."); break
                     except discord.NotFound: print(f"Warning: [Scan G:{guild_id}] Msg {entry_msg_id} not found reply.")
                     except Exception as e: print(f"DEBUG: [Scan G:{guild_id}] Failed reply {entry_msg_id}: {e}")
+
                 if flag_duplicates:
                     try:
                         refreshed = await channel.fetch_message(entry_message_obj.id)
@@ -1170,16 +1302,22 @@ async def scan_history(
                     except discord.Forbidden: print(f"Warning: [Scan G:{guild_id}] No React perm {entry_msg_id}."); break
                     except discord.NotFound: print(f"Warning: [Scan G:{guild_id}] Msg {entry_msg_id} not found react.")
                     except Exception as e: print(f"DEBUG: [Scan G:{guild_id}] Failed react {entry_msg_id}: {e}")
+
                 if delete_duplicates:
-                    try: await entry_message_obj.delete(); deleted_count += 1; action_taken = True; print(f"DEBUG: [Scan G:{guild_id}] Deleted msg {entry_msg_id}")
+                    try:
+                        await entry_message_obj.delete()
+                        deleted_count += 1
+                        action_taken = True
+                        print(f"DEBUG: [Scan G:{guild_id}] Deleted msg {entry_msg_id}")
                     except discord.Forbidden: print(f"Warning: [Scan G:{guild_id}] No Manage perm delete {entry_msg_id}."); break
                     except discord.NotFound: print(f"Warning: [Scan G:{guild_id}] Msg {entry_msg_id} not found delete.")
                     except Exception as e: print(f"DEBUG: [Scan G:{guild_id}] Failed delete {entry_msg_id}: {e}")
-                if action_taken: await asyncio.sleep(SCAN_ACTION_DELAY)
+
+                if action_taken:
+                    await asyncio.sleep(SCAN_ACTION_DELAY)
 
     if guild_db_updated:
         print(f"DEBUG: [Scan G:{guild_id}] Saving hash DB after scan...")
-        # --- Corrected Syntax ---
         if not await save_guild_hashes(guild_id, stored_hashes, loop):
             print(f"ERROR: [Scan G:{guild_id}] CRITICAL: Failed save hash DB!")
             try:
@@ -1188,21 +1326,20 @@ async def scan_history(
                 print(f"ERROR: [Scan G:{guild_id}] Failed save AND followup warn.")
         else:
             print(f"DEBUG: [Scan G:{guild_id}] Hash DB saved.")
-        # --- End Correction ---
     if guild_id in active_hash_databases: del active_hash_databases[guild_id]
 
     elapsed_phase2 = (datetime.datetime.now() - start_time_phase2).total_seconds()
     total_elapsed = (datetime.datetime.now() - start_time_phase1).total_seconds()
     print(f"DEBUG: [Scan G:{guild_id}] Phase 2 complete ({elapsed_phase2:.2f}s). Total: {total_elapsed:.2f}s.")
-    # --- Reverted to full words ---
     final_message_content = (
         f"✅ Scan Complete! Processed {processed_messages} messages ({total_elapsed:.2f}s). "
         f"Added:{added_hashes}, Updated:{updated_hashes}, Replied:{replied_count}, "
         f"Flagged:{flagged_count}, Deleted:{deleted_count}, Logged:{logged_count}. "
         f"Skipped:{skipped_attachments}. Errors:{errors}."
     )
-    # --- End Revert ---
-    try: await status_message.edit(content=final_message_content); print(f"DEBUG: [Scan G:{guild_id}] Edited final status.")
+    try:
+        await status_message.edit(content=final_message_content)
+        print(f"DEBUG: [Scan G:{guild_id}] Edited final status.")
     except discord.HTTPException as e:
         print(f"DEBUG: [Scan G:{guild_id}] Edit status failed (Status: {e.status}, Code: {e.code}). Sending new.");
         if e.code == 50027 or e.status == 401:
@@ -1253,11 +1390,9 @@ async def clear_flags(interaction: discord.Interaction, channel: discord.Option(
                 except discord.Forbidden: print(f"Warning: [ClearFlags G:{guild_id}] No perm remove reaction {channel.mention}. Stop."); errors += 1; final_status_content = f"⚠️ Stopped due to perm error. Checked {processed_msgs}. Removed {reactions_removed}."; break
                 except discord.NotFound: pass
                 except Exception as e: print(f"Error: [ClearFlags G:{guild_id}] Failed remove reaction {message.id}: {e}"); errors += 1
-        # --- Reverted to full words ---
         if not final_status_content:
             elapsed = (datetime.datetime.now() - start_time).total_seconds()
             final_status_content = (f"✅ Cleanup Complete! Checked {processed_msgs} messages ({elapsed:.2f}s). Removed **{reactions_removed}** reactions. Errors: {errors}.")
-        # --- End Revert ---
     except discord.Forbidden: final_status_content = f"❌ Cleanup failed. No 'Read History' perm in {channel.mention}."; errors += 1
     except Exception as e: final_status_content = f"❌ Error during cleanup: {e}"; traceback.print_exc(); errors += 1
     finally:
