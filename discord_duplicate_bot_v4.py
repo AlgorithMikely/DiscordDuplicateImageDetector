@@ -658,6 +658,108 @@ async def on_message(message):
         if not await save_guild_hashes(guild_id, stored_hashes, loop): print(f"ERROR: [G:{guild_id}] Failed save hash DB after msg {message.id}!")
 
 
+@bot.event
+async def on_message_delete(message: discord.Message):
+    """Handles removal of hashes when a message is deleted."""
+    if message.guild is None or message.author.bot: # Ignore DMs and bot messages
+        return
+
+    guild_id = message.guild.id
+    channel_id = message.channel.id # For logging and channel scope
+    guild_config = get_guild_config(guild_id)
+    loop = asyncio.get_running_loop()
+
+    # Load hashes, make a copy to modify
+    # No need to load into active_hash_databases here as we are modifying, not just reading for a short op
+    db_file = guild_config['hash_db_file']
+    lock = get_hash_file_lock(guild_id)
+    async with lock: # Ensure exclusive access for load-modify-save sequence if possible
+        # Or load first, then acquire lock before save if load_guild_hashes itself is fully async safe
+        # For simplicity and safety, let's assume load_guild_hashes is fine, but operate on a copy
+        # then re-acquire lock for saving.
+        # More robust: load_hashes_sync, modify, save_hashes_sync all within the file lock.
+
+        # Let's use the existing load_guild_hashes which uses active_hash_databases
+        # This means we need to be careful if save fails.
+        # Alternative: direct load_hashes_sync, but that bypasses the active_hash_databases cache for other ops.
+        # Sticking with load_guild_hashes and save_guild_hashes for consistency.
+        # If save fails, the cache (active_hash_databases[guild_id]) might be inconsistent with disk.
+        # The current save_guild_hashes updates active_hash_databases on success.
+
+        stored_hashes_original = await load_guild_hashes(guild_id, loop)
+        # It's critical to work on a copy if modifications are made before saving.
+        hashes_to_modify = {k: (v.copy() if isinstance(v, dict) else v) for k, v in stored_hashes_original.items()}
+
+
+    current_scope = guild_config.get('duplicate_scope', 'server')
+    deleted_message_id_str = str(message.id)
+    hash_removed_details = [] # Store tuples of (identifier, hash_value, ?channel_id_str)
+    db_changed = False
+
+    if current_scope == "server":
+        # Iterate over a list of keys if modifying the dict during iteration
+        for identifier_key in list(hashes_to_modify.keys()):
+            if identifier_key.startswith(deleted_message_id_str + "-"):
+                removed_data = hashes_to_modify.pop(identifier_key)
+                db_changed = True
+                hash_value = removed_data.get('hash') if isinstance(removed_data, dict) else str(removed_data)
+                hash_removed_details.append({'id': identifier_key, 'hash': hash_value, 'channel': channel_id})
+    elif current_scope == "channel":
+        channel_id_str = str(channel_id) # Message was deleted from this channel
+        if channel_id_str in hashes_to_modify and isinstance(hashes_to_modify[channel_id_str], dict):
+            channel_hashes = hashes_to_modify[channel_id_str]
+            # Iterate over a list of keys if modifying the dict during iteration
+            for identifier_key in list(channel_hashes.keys()):
+                if identifier_key.startswith(deleted_message_id_str + "-"):
+                    removed_data = channel_hashes.pop(identifier_key)
+                    db_changed = True
+                    hash_value = removed_data.get('hash') if isinstance(removed_data, dict) else str(removed_data)
+                    hash_removed_details.append({'id': identifier_key, 'hash': hash_value, 'channel': channel_id})
+
+            # If the channel's hash dict is now empty, remove the channel key
+            if not channel_hashes:
+                hashes_to_modify.pop(channel_id_str, None) # None to prevent KeyError if somehow already removed
+                # db_changed is already true if we removed any hash entry
+                print(f"DEBUG: [G:{guild_id}] Emptied and removed channel {channel_id_str} from hash DB.")
+
+
+    if db_changed and hash_removed_details:
+        save_successful = await save_guild_hashes(guild_id, hashes_to_modify, loop)
+        if save_successful:
+            print(f"INFO: [G:{guild_id} C:{channel_id}] Removed {len(hash_removed_details)} hash(es) for deleted msg ID {message.id}.")
+            log_embed = discord.Embed(
+                title="Hashes Removed (Message Deleted)",
+                color=discord.Color.blue(),
+                timestamp=datetime.datetime.now(datetime.timezone.utc)
+            )
+            log_embed.add_field(name="Guild", value=f"{message.guild.name} (`{guild_id}`)", inline=False)
+            log_embed.add_field(name="Channel", value=f"{message.channel.mention} (`{channel_id}`)", inline=False)
+            log_embed.add_field(name="Deleted Message ID", value=f"`{message.id}`", inline=False)
+
+            # Display up to N removed hashes to prevent huge embeds
+            MAX_DISPLAY_HASHES = 5
+            display_count = 0
+            for detail in hash_removed_details:
+                if display_count < MAX_DISPLAY_HASHES:
+                    field_name = f"Removed: `{detail['id']}`"
+                    field_value = f"Hash: `{detail['hash']}`"
+                    log_embed.add_field(name=field_name, value=field_value, inline=False)
+                    display_count +=1
+                else:
+                    log_embed.add_field(name=f"And {len(hash_removed_details) - MAX_DISPLAY_HASHES} more...", value="...", inline=False)
+                    break
+
+            log_embed.set_footer(text=f"Scope: {current_scope}")
+            if message.guild: # Ensure guild context for log_event
+                 await log_event(message.guild, log_embed)
+        else:
+            print(f"ERROR: [G:{guild_id} C:{channel_id}] Failed to save hash DB after removing entries for deleted msg ID {message.id}.")
+            # Potentially revert active_hash_databases[guild_id] to stored_hashes_original
+            # This is risky if other operations modified it in the meantime.
+            # For now, accept that the cache might be dirty until next load if save fails.
+            # Or, better: ensure save_guild_hashes only updates cache on true success. (It does)
+
+
 # --- Slash Command Definitions ---
 
 # Helper for permission checks
@@ -1017,31 +1119,64 @@ def parse_message_id(message_ref: str) -> int | None:
 
 @bot.slash_command(name="hash_remove", description="Removes stored hash(es) for a specific message ID/link.")
 async def remove_hash(interaction: discord.Interaction, message_reference: discord.Option(str, "Message ID or link.")):
-    if not interaction.guild_id: await interaction.response.send_message("❌ Server only.", ephemeral=True); return
-    if not await check_admin_permissions(interaction): return
-    guild_id = interaction.guild_id; guild_config = get_guild_config(guild_id)
-    current_scope = guild_config.get('duplicate_scope', 'server'); loop = asyncio.get_running_loop()
+    if not interaction.guild_id:
+        await interaction.response.send_message("❌ Server only.", ephemeral=True)
+        return
+    if not await check_admin_permissions(interaction):
+        return # check_admin_permissions sends its own response
+
+    await interaction.response.defer(ephemeral=True)
+    guild_id = interaction.guild_id
+    guild_config = get_guild_config(guild_id)
+    loop = asyncio.get_running_loop()
+
     target_message_id = parse_message_id(message_reference)
-    if target_message_id is None: await interaction.response.send_message("❌ Invalid message ID/link format.", ephemeral=True); return
+    if target_message_id is None:
+        await interaction.followup.send("❌ Invalid message ID/link format.", ephemeral=True)
+        return
+
     target_message_id_str = str(target_message_id)
-    stored_hashes = await load_guild_hashes(guild_id, loop); stored_hashes = stored_hashes.copy()
-    hash_removed = False; keys_removed = []
-    target_channel_key = None
-    if not isinstance(stored_hashes, dict): await interaction.response.send_message("ℹ️ Hash DB empty/invalid.", ephemeral=True); return
+
+    # Load and deep copy hashes
+    stored_hashes_original = await load_guild_hashes(guild_id, loop)
+    if not isinstance(stored_hashes_original, dict) or not stored_hashes_original:
+        await interaction.followup.send("ℹ️ Hash DB is empty or invalid. No hashes to remove.", ephemeral=True)
+        return
+
+    hashes_to_modify = {k: (v.copy() if isinstance(v, dict) else v) for k, v in stored_hashes_original.items()}
+
+    db_changed = False
+    keys_removed_count = 0
+    current_scope = guild_config.get('duplicate_scope', 'server')
+
     if current_scope == "server":
-        keys_to_remove_now = [k for k in stored_hashes if k.startswith(target_message_id_str + "-")]
-        for key in keys_to_remove_now: del stored_hashes[key]; keys_removed.append(key); hash_removed = True
+        for identifier_key in list(hashes_to_modify.keys()): # Iterate over a copy of keys
+            if identifier_key.startswith(target_message_id_str + "-"):
+                hashes_to_modify.pop(identifier_key)
+                keys_removed_count += 1
+                db_changed = True
     elif current_scope == "channel":
-        for ch_id_str, channel_hashes in stored_hashes.items():
-            if isinstance(channel_hashes, dict):
-                keys_to_remove_now = [k for k in channel_hashes if k.startswith(target_message_id_str + "-")]
-                if keys_to_remove_now: target_channel_key = ch_id_str
-                for key in keys_to_remove_now: del channel_hashes[key]; keys_removed.append(key); hash_removed = True
-        if target_channel_key and not stored_hashes[target_channel_key]: del stored_hashes[target_channel_key]
-    if hash_removed:
-        if await save_guild_hashes(guild_id, stored_hashes, loop): await interaction.response.send_message(f"✅ Removed {len(keys_removed)} hash(es) for msg ID `{target_message_id}`.", ephemeral=True)
-        else: await interaction.response.send_message("⚠️ Error saving hash DB.", ephemeral=True)
-    else: await interaction.response.send_message(f"ℹ️ No hashes found for msg ID `{target_message_id}`.", ephemeral=True)
+        for channel_id_key in list(hashes_to_modify.keys()): # Iterate over a copy of channel keys
+            if isinstance(hashes_to_modify.get(channel_id_key), dict):
+                channel_hashes = hashes_to_modify[channel_id_key]
+                for identifier_key in list(channel_hashes.keys()): # Iterate over a copy of identifier keys
+                    if identifier_key.startswith(target_message_id_str + "-"):
+                        channel_hashes.pop(identifier_key)
+                        keys_removed_count += 1
+                        db_changed = True
+
+                if not channel_hashes and channel_id_key in hashes_to_modify: # If channel dict is now empty
+                    hashes_to_modify.pop(channel_id_key)
+                    # db_changed is already true if keys_removed_count > 0
+                    print(f"DEBUG: [G:{guild_id}] Emptied and removed channel {channel_id_key} from hash DB during hash_remove.")
+
+    if db_changed:
+        if await save_guild_hashes(guild_id, hashes_to_modify, loop):
+            await interaction.followup.send(f"✅ Removed {keys_removed_count} hash(es) for message ID `{target_message_id}`.", ephemeral=True)
+        else:
+            await interaction.followup.send("⚠️ Error saving updated hash DB.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"ℹ️ No hashes found for message ID `{target_message_id}`.", ephemeral=True)
 
 @bot.slash_command(name="hash_clear", description="Clears hashes for server or channel. Requires confirmation!")
 async def clear_hashes(interaction: discord.Interaction, confirm: discord.Option(bool, "Confirm deletion?"), channel: discord.Option(discord.TextChannel, "Optional: Clear only this channel (if scope='channel').", required=False, default=None)):
